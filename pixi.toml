@@ -1,0 +1,29 @@
+[workspace]
+name = "fuelnozzle"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = "3.11.*"
+fluids = ">=1.2"
+ht = ">=1.1"
+numpy = ">=2.0"
+pint = ">=0.24"
+pydantic = ">=2.10"
+scipy = ">=1.14"
+pytest = ">=8.3"
+pytest-cov = ">=6.0"
+ruff = ">=0.9"
+tectonic = ">=0.15"
+
+[pypi-dependencies]
+fuelnozzle = { path = ".", editable = true }
+coolprop = ">=8.0"
+
+[tasks]
+test = "pytest -q"
+lint = "ruff check src tests examples"
+format = "ruff format src tests examples"
+check = { depends-on = ["lint", "test"] }
+example = "python examples/run_study.py"
+doc = "tectonic docs/technical_reference.tex --keep-logs"

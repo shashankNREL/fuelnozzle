@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fuelnozzle"
+version = "0.1.0"
+description = "Reduced-order Jet-A pressure-swirl and flashing LNG fuel-nozzle design tool."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "CoolProp>=8.0",
+    "fluids>=1.2",
+    "ht>=1.1",
+    "numpy>=2.0",
+    "pint>=0.24",
+    "pydantic>=2.10",
+    "scipy>=1.14",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-cov>=6.0", "ruff>=0.9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

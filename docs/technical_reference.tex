@@ -1,0 +1,1160 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{xurl}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!65!black,
+  citecolor=green!40!black,
+  pdftitle={Fuel-Nozzle Technical Reference},
+  pdfauthor={fuelnozzle project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Fuel-Nozzle Technical Reference}
+\rhead{Version 0.1.0}
+\cfoot{\thepage}
+
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\srcline}[2]{\nolinkurl{#1:#2}}
+\newcommand{\unit}[1]{\,\mathrm{#1}}
+\setlength{\emergencystretch}{3em}
+\newcommand{\warningbox}[1]{%
+  \begin{center}
+  \fcolorbox{orange!60!black}{orange!8}{%
+    \parbox{0.91\textwidth}{\textbf{Engineering caution.} #1}}
+  \end{center}}
+
+\title{Fuel-Nozzle Technical Reference\\
+\large Jet-A Pressure-Swirl and Flashing LNG Models\\
+\large Beginner-Oriented Equations, Algorithms, Source Locations, and Limitations}
+\author{fuelnozzle project}
+\date{Source map generated 2026-08-26}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report explains the equations and software implementation of the
+\code{fuelnozzle} package for a reader with no prior background in fluid mechanics,
+thermodynamics, atomization, or Python. The package studies two fuel circuits:
+a Jet-A pressure-swirl atomizer and a liquid-LNG nozzle that may remain liquid,
+flash inside the nozzle, or flash after discharge. Every major equation is connected
+to the current Python function and line where it is implemented. The report also
+separates physical laws from numerical approximations and empirical calibration.
+It should be read as documentation for a reduced-order screening tool, not as a
+hardware certification method.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{How to Read This Report}
+
+A physical equation describes a relationship among measurable quantities. A
+software implementation turns that relationship into arithmetic and decision logic.
+The same equation can be implemented correctly while still being unsuitable for a
+particular injector. Therefore, four questions must always be kept separate:
+
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{Was the equation entered correctly?} This is software verification.
+  \item \textbf{Does the numerical method converge?} This is numerical verification.
+  \item \textbf{Does the model match experiments?} This is validation.
+  \item \textbf{Is the experiment similar enough to the intended LNG/Jet-A design?}
+        This is the applicability question.
+\end{enumerate}
+
+Source references have the form \srcline{src/fuelnozzle/lng.py}{256}. They refer to
+the source state on 2026-08-26. Function names are stable references; line numbers
+will move when source files are edited.
+
+\warningbox{The current code is a steady, zero/one-dimensional engineering screen.
+It does not resolve the three-dimensional vortex, individual vapor bubbles, primary
+breakup, combustion chemistry, flame stability, or structural integrity.}
+
+\section{Basic Vocabulary for a New Reader}
+
+\subsection{Pressure, temperature, and flow}
+
+\begin{description}[style=nextline]
+  \item[Pressure $P$ (Pa)] Force divided by area. One atmosphere is approximately
+  $101325\unit{Pa}$. All code inputs are absolute pressures unless an external data
+  source explicitly states otherwise.
+  \item[Temperature $T$ (K)] Thermodynamic temperature. To convert Celsius to kelvin,
+  add 273.15.
+  \item[Mass flow $\dot m$ (kg/s)] Fuel mass passing a location each second.
+  \item[Area $A$ ($\mathrm{m^2}$)] Flow-passage cross-sectional area.
+  \item[Density $\rho$ ($\mathrm{kg/m^3}$)] Mass per unit volume.
+  \item[Velocity $u$ (m/s)] Speed of the fluid.
+  \item[Mass flux $G$ ($\mathrm{kg/(m^2\,s)}$)] Mass flow per area:
+  \begin{equation}
+    G = \frac{\dot m}{A} = \rho u.
+    \label{eq:mass-flux-definition}
+  \end{equation}
+\end{description}
+
+Mass flux is useful because a nozzle with twice the area carries twice the mass flow
+when $G$ is unchanged.
+
+\subsection{Liquid, vapor, saturation, and flashing}
+
+A pure substance can exist as a liquid or vapor. At a given pressure below the
+critical point, there is a saturation temperature. A liquid colder than saturation is
+\emph{subcooled}. A liquid at saturation can begin boiling without further heating.
+
+LNG is a mixture, so it does not have one boiling temperature. At a given pressure:
+
+\begin{itemize}
+  \item the \textbf{bubble temperature} is where the first vapor bubble can appear;
+  \item the \textbf{dew temperature} is where the last liquid droplet disappears.
+\end{itemize}
+
+\emph{Flashing} is rapid vapor production caused by a pressure reduction. A liquid
+can be thermodynamically able to flash but remain temporarily liquid because bubble
+nucleation and growth require finite time. That temporary state is called
+\emph{metastable}.
+
+\subsection{Enthalpy, entropy, and quality}
+
+\begin{description}[style=nextline]
+  \item[Specific enthalpy $h$ (J/kg)] An energy-like state property useful for flow
+  energy balances. In an adiabatic throttling process, $h$ is often approximately
+  constant.
+  \item[Specific entropy $s$ (J/(kg K))] A thermodynamic state property. An ideal
+  adiabatic, reversible acceleration follows constant entropy.
+  \item[Vapor quality $x$] Vapor mass divided by total liquid-plus-vapor mass. Thus
+  $x=0$ is all liquid and $x=1$ is all vapor.
+\end{description}
+
+\subsection{Choking}
+
+A flow is choked when reducing downstream pressure no longer increases mass flow.
+For a flashing liquid, this may occur because vapor production makes the fluid highly
+compressible. The current Tier 1 code calls a case choked when the maximum sampled
+mass flux occurs at a pressure measurably above the outlet pressure.
+
+\subsection{Atomization terms}
+
+\begin{description}[style=nextline]
+  \item[Pressure-swirl atomizer] A nozzle that sends liquid through tangential ports,
+  forming a rotating liquid film and usually a hollow cone.
+  \item[Air core] The low-density central region inside the rotating liquid annulus.
+  \item[Film thickness] Radial thickness of liquid at the exit.
+  \item[Cone angle] Angular width of the spray. This report distinguishes semi-angle
+  from full cone angle. The code reports full cone angle.
+  \item[SMD or $D_{32}$] Sauter mean diameter, the diameter of a hypothetical uniform
+  spray with the same volume-to-surface-area ratio as the actual droplets.
+  \item[$D_{10}$] Arithmetic mean droplet diameter. It is not interchangeable with SMD.
+\end{description}
+
+\section{Software Architecture and Data Flow}
+
+For each flight-stage operating point, the software performs this sequence:
+
+\begin{enumerate}
+  \item Validate user inputs in \code{OperatingPoint}.
+  \item Close the pump/feed/nozzle pressure budget.
+  \item Create or reuse a CoolProp state for methane or an LNG composition.
+  \item Optionally march the LNG through a heated feed line.
+  \item Run LNG Tier 0, Tier 1, Tier 2, and Tier 3 in order.
+  \item Independently run the Jet-A pressure-swirl calculation.
+  \item Gather warnings instead of silently repairing inconsistent inputs.
+  \item Integrate stage mass flows when all durations are available.
+\end{enumerate}
+
+The public study owner is \code{run_nozzle_study} at
+\srcline{src/fuelnozzle/study.py}{75}. It creates one
+\code{CoolPropLNGProvider} and reuses it for all operating points.
+
+\section{Input Pressure Contract}
+
+The user supplies compressor/combustor station values $P_3,T_3$, pump discharge
+pressure, and nozzle pressure drop. The model currently treats $P_3$ as the receiving
+pressure immediately downstream of each fuel nozzle.
+
+The required nozzle inlet pressure is
+
+\begin{equation}
+  P_{n,\mathrm{in}} = P_3 + \Delta P_n.
+  \label{eq:nozzle-inlet-pressure}
+\end{equation}
+
+The pressure remaining for pipes, bends, valves, and manifolds is
+
+\begin{equation}
+  \Delta P_{\mathrm{feed,available}}
+  = P_{\mathrm{pump,out}} - P_{n,\mathrm{in}}.
+  \label{eq:feed-pressure-budget}
+\end{equation}
+
+Equations~\eqref{eq:nozzle-inlet-pressure}--\eqref{eq:feed-pressure-budget} are
+implemented by \code{fuel_pressure_budget} at
+\srcline{src/fuelnozzle/operating.py}{55}, specifically lines 62--63.
+
+If Equation~\eqref{eq:feed-pressure-budget} is negative, the point is hydraulically
+infeasible. The code returns an error-level warning but does not alter $P_3$ or any
+pressure input.
+
+\warningbox{Real gas-turbine notation often uses $P_3$ for compressor discharge,
+while pressure at the fuel nozzle can differ due to diffuser and liner losses. The
+current interface does not separate these locations. Supply the pressure appropriate
+to the nozzle receiving environment, or extend the data model.}
+
+\section{Thermodynamic Property Model}
+
+\subsection{LNG composition}
+
+The user supplies nonnegative component mole fractions $z_i$. The input validator
+normalizes them:
+
+\begin{equation}
+  z_i^{\mathrm{normalized}} = \frac{z_i}{\sum_j z_j}.
+  \label{eq:composition-normalization}
+\end{equation}
+
+This occurs in \code{LNGComposition.validate_and_normalize} at
+\srcline{src/fuelnozzle/models.py}{37}.
+
+\subsection{CoolProp state objects}
+
+\code{CoolPropLNGProvider.__init__} at
+\srcline{src/fuelnozzle/properties.py}{29} creates one reusable CoolProp
+\code{AbstractState}. Pure methane uses direct CoolProp input pairs. For a mixture,
+CoolProp supports PT, PQ, and TQ state updates but not every PH or PS flash needed by
+the nozzle path.
+
+\subsection{Mixture PH and PS roots}
+
+For a requested pressure $P$ and target enthalpy $h^*$, the code finds a temperature
+that satisfies
+
+\begin{equation}
+  f_h(T) = h(P,T,\mathbf z)-h^* = 0.
+  \label{eq:ph-root}
+\end{equation}
+
+For target entropy $s^*$, it solves
+
+\begin{equation}
+  f_s(T) = s(P,T,\mathbf z)-s^* = 0.
+  \label{eq:ps-root}
+\end{equation}
+
+The common implementation is \code{_mixture_target_state} at
+\srcline{src/fuelnozzle/properties.py}{152}. The residual is defined at line 160,
+and SciPy's bracketed Brent method is called at line 210. The previous station's
+temperature is used to find a nearby bracket; a wider scan is used only when local
+continuation fails.
+
+This approach is slower than a direct flash, but a bracketed root is robust and does
+not require inventing mixture thermodynamics outside CoolProp.
+
+\subsection{Molar quality to mass quality}
+
+CoolProp's mixture quality is molar. The hydraulics require mass quality. Let $Q$ be
+molar vapor fraction, $M_v$ vapor-phase molar mass, and $M_l$ liquid-phase molar
+mass. Vapor and liquid masses for an arbitrary one-mole total basis are
+
+\begin{align}
+  m_v &= Q M_v, \\
+  m_l &= (1-Q)M_l.
+\end{align}
+
+The mass quality is
+
+\begin{equation}
+  x = \frac{Q M_v}{Q M_v + (1-Q)M_l}.
+  \label{eq:mass-quality-conversion}
+\end{equation}
+
+Implemented by \code{_mass_quality} at
+\srcline{src/fuelnozzle/properties.py}{370}, with phase molar masses at lines
+375--390 and Equation~\eqref{eq:mass-quality-conversion} at lines 391--393.
+
+\subsection{Mixture transport fallback}
+
+When CoolProp has no native LNG-mixture viscosity or conductivity, the provider uses
+component values. Viscosity uses logarithmic mole mixing:
+
+\begin{equation}
+  \mu_{\mathrm{mix}} = \exp\left(\sum_i \hat z_i\ln\mu_i\right),
+  \qquad \hat z_i=\frac{z_i}{\sum_{j\in\mathcal A}z_j},
+  \label{eq:viscosity-mixing}
+\end{equation}
+
+where $\mathcal A$ is the set of components for which a value is available.
+Conductivity and surface tension use linear mole mixing:
+
+\begin{align}
+  k_{\mathrm{mix}} &= \sum_i \hat z_i k_i, \\
+  \sigma_{\mathrm{mix}} &= \sum_i \hat z_i \sigma_i.
+  \label{eq:linear-transport-mixing}
+\end{align}
+
+Implemented by \code{_component_transport_fallback} at
+\srcline{src/fuelnozzle/properties.py}{281}; Equations
+\eqref{eq:viscosity-mixing}--\eqref{eq:linear-transport-mixing} are at lines
+345--367.
+
+If a pure component cannot be forced into a liquid PT state, its saturated-liquid
+transport at the same temperature is attempted. Any omitted component is named in a
+warning.
+
+\warningbox{These transport mixing rules are engineering fallbacks, not a validated
+LNG transport model. Density, enthalpy, entropy, and equilibrium still come from the
+mixture EOS; only missing transport quantities are approximated.}
+
+\section{Cryogenic LNG Feed Line}
+
+\subsection{Segmentation}
+
+The feed line is divided into equal axial segments. At each segment, the solver:
+
+\begin{enumerate}
+  \item reconstructs the state from local $P$ and $h$;
+  \item estimates heat ingress;
+  \item selects single- or two-phase pressure loss;
+  \item subtracts pressure loss;
+  \item adds heat to enthalpy.
+\end{enumerate}
+
+The owner is \code{solve_lng_feed_line} at
+\srcline{src/fuelnozzle/feed.py}{63}.
+
+\subsection{Pipe area and mass flux}
+
+For inner diameter $D$,
+
+\begin{equation}
+  A_p = \frac{\pi D^2}{4}, \qquad G=\frac{\dot m}{A_p}.
+  \label{eq:pipe-area-flux}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/feed.py}{94}--95.
+
+\subsection{Segment energy update}
+
+If heat leak per length is $q'$ and segment length is $\Delta z$, segment heat is
+$q'\Delta z$. Dividing by mass flow gives the enthalpy rise:
+
+\begin{equation}
+  h_{j+1}=h_j+\frac{q'_j\Delta z}{\dot m}.
+  \label{eq:feed-enthalpy-update}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/feed.py}{148}.
+
+\subsection{Internal heat transfer}
+
+The standard dimensionless groups are
+
+\begin{align}
+  \mathrm{Re} &= \frac{G D}{\mu}, \\
+  \mathrm{Pr} &= \frac{c_p\mu}{k}, \\
+  h_i &= \frac{\mathrm{Nu}\,k}{D}.
+  \label{eq:feed-heat-groups}
+\end{align}
+
+ChEDL \code{ht} selects the internal-flow Nusselt correlation, and cylindrical
+conduction combines internal convection, wall, insulation, and external convection.
+The implementation is \code{_heat_leak_per_length} at
+\srcline{src/fuelnozzle/feed.py}{230}, with the quantities at lines 244--267.
+A measured heat leak in W/m bypasses this correlation chain.
+
+\subsection{Single-phase pressure loss}
+
+The dynamic pressure written in terms of mass flux is
+
+\begin{equation}
+  q_d=\frac{G^2}{2\rho}.
+  \label{eq:dynamic-pressure}
+\end{equation}
+
+For Darcy friction factor $f$, distributed minor-loss coefficient $K$, segment
+length $\Delta z$, and diameter $D$,
+
+\begin{equation}
+  \Delta P_{f+K}=\left(f\frac{\Delta z}{D}+K\right)\frac{G^2}{2\rho}.
+  \label{eq:darcy-minor-loss}
+\end{equation}
+
+Static head is
+
+\begin{equation}
+  \Delta P_g=\rho g\Delta y.
+  \label{eq:static-head}
+\end{equation}
+
+Implemented by \code{_liquid_segment_pressure_drop} at
+\srcline{src/fuelnozzle/feed.py}{270}, with Equations
+\eqref{eq:dynamic-pressure}--\eqref{eq:static-head} at lines 283--294.
+
+\subsection{Two-phase pressure loss}
+
+ChEDL \code{two_phase_dP} supplies frictional loss. The current selection is
+\code{Kim_Mudawar} when $D\leq 6.22\unit{mm}$ and \code{Chisholm} for larger
+lines. Static head uses homogeneous mixture density
+
+\begin{equation}
+  \rho_m=\left(\frac{1-x}{\rho_l}+\frac{x}{\rho_v}\right)^{-1}.
+  \label{eq:homogeneous-density}
+\end{equation}
+
+Implemented by \code{_two_phase_segment_pressure_drop} at
+\srcline{src/fuelnozzle/feed.py}{297}; correlation call and density occur at lines
+315--333.
+
+The current feed model does not add a separate two-phase acceleration pressure-drop
+term. This is a known limitation when quality changes rapidly.
+
+\section{LNG Tier 0: Is Flashing Thermodynamically Possible?}
+
+\subsection{Subcooling margins}
+
+The temperature subcooling margin is
+
+\begin{equation}
+  \Delta T_{sub}=T_{bubble}(P,\mathbf z)-T.
+  \label{eq:temperature-margin}
+\end{equation}
+
+The pressure subcooling margin is
+
+\begin{equation}
+  \Delta P_{sub}=P-P_{bubble}(T,\mathbf z).
+  \label{eq:pressure-margin}
+\end{equation}
+
+Positive values indicate equilibrium liquid margin. Implemented by
+\code{screen_lng_flash} at \srcline{src/fuelnozzle/lng.py}{151}, specifically
+lines 192--193.
+
+\subsection{Equilibrium exit quality}
+
+The nozzle inlet enthalpy is flashed isenthalpically to $P_3$. If the result is
+two-phase, its mass quality is the equilibrium flash fraction. This is a
+thermodynamic availability calculation, not a bubble-growth prediction.
+
+\subsection{Equilibrium onset location}
+
+The code assumes pressure changes linearly from nozzle inlet pressure $P_{in}$ to
+$P_3$. If bubble pressure is $P_b$, the fractional axial position is
+
+\begin{equation}
+  \xi_{eq}=\frac{P_{in}-P_b}{P_{in}-P_3}.
+  \label{eq:equilibrium-onset-location}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/lng.py}{223}. If $\xi_{eq}\geq0.98$, the
+screen calls onset an exit event; otherwise it calls it internal.
+
+\warningbox{Equation~\eqref{eq:equilibrium-onset-location} is a geometric screen.
+The code does not solve the internal nozzle pressure profile from momentum and wall
+friction.}
+
+\section{LNG Tier 1: SPI and HEM Mass-Flow Bounds}
+
+\subsection{Single-phase incompressible bound}
+
+Bernoulli's equation gives ideal liquid speed $u=\sqrt{2\Delta P/\rho}$. Multiplying
+by density gives
+
+\begin{equation}
+  G_{SPI}=\sqrt{2\rho_0\Delta P_n}.
+  \label{eq:spi-flux}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/lng.py}{302}--306.
+
+\subsection{Homogeneous equilibrium path}
+
+HEM assumes liquid and vapor share velocity, pressure, and temperature and reach
+local phase equilibrium instantly. The current path is isentropic:
+
+\begin{equation}
+  s(P)=s_0.
+  \label{eq:isentropic-path}
+\end{equation}
+
+At each sampled pressure, stagnation enthalpy is converted to kinetic energy:
+
+\begin{equation}
+  u(P)=\sqrt{2\max\left(0,h_0-h(P,s_0)\right)}.
+  \label{eq:hem-velocity}
+\end{equation}
+
+Mass flux follows:
+
+\begin{equation}
+  G_{HEM}(P)=\rho(P,s_0)u(P).
+  \label{eq:hem-flux}
+\end{equation}
+
+Implemented by \code{solve_lng_equilibrium_flow} at
+\srcline{src/fuelnozzle/lng.py}{256}; Equations
+\eqref{eq:hem-velocity}--\eqref{eq:hem-flux} are lines 281--283.
+
+\subsection{Critical condition and choking decision}
+
+The sampled critical mass flux is
+
+\begin{equation}
+  G^*=\max_{P_3\leq P\leq P_{in}}G_{HEM}(P),
+  \qquad P^*=\operatorname*{arg\,max}_P G_{HEM}(P).
+  \label{eq:critical-flux}
+\end{equation}
+
+The software reports choking when
+
+\begin{equation}
+  P^*>P_3+\epsilon_P P_{in},
+  \label{eq:choking-test}
+\end{equation}
+
+where default $\epsilon_P=0.005$. This logic is at lines 295--300 of
+\code{solve_lng_equilibrium_flow}.
+
+This is a numerical maximum criterion, not an explicit sonic-eigenvalue calculation.
+Grid convergence is therefore a required verification test.
+
+\subsection{Area and diameter sizing}
+
+For discharge coefficient $C_d$ and selected operating mass flux $G_{op}$,
+
+\begin{equation}
+  A_{req}=\frac{\dot m}{C_dG_{op}}.
+  \label{eq:lng-area}
+\end{equation}
+
+For $N$ equal circular holes, diameter per hole is
+
+\begin{equation}
+  D_{req}=\sqrt{\frac{4A_{req}}{\pi N}}.
+  \label{eq:lng-diameter}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/lng.py}{310}--315.
+
+The discharge coefficient is user-specified (default 0.80). HEM does not itself
+predict vena-contracta and wall-loss effects.
+
+\section{LNG Tier 2: Finite-Rate Relaxation Screen}
+
+\subsection{Why a relaxation model is needed}
+
+A short nozzle may not allow enough time for equilibrium vapor to form. The conceptual
+continuous model is
+
+\begin{equation}
+  \frac{Dx}{Dt}=\frac{x_{eq}-x}{\tau},
+  \label{eq:continuous-relaxation}
+\end{equation}
+
+where $\tau$ is a fitted relaxation time. The implementation uses the exact update for
+constant $x_{eq}$ over one time step:
+
+\begin{equation}
+  x_{j+1}=x_j+\left(1-e^{-\Delta t_j/\tau}\right)
+  \left(x_{eq,j+1}-x_j\right).
+  \label{eq:discrete-relaxation}
+\end{equation}
+
+\subsection{Nucleation delay}
+
+Relaxation is allowed only below
+
+\begin{equation}
+  P_{nuc}=\max\left(0,P_{bubble}-\Delta P_{delay}\right).
+  \label{eq:nucleation-threshold}
+\end{equation}
+
+A larger $\Delta P_{delay}$ lets liquid remain metastable to lower pressure.
+Equation~\eqref{eq:nucleation-threshold} is at
+\srcline{src/fuelnozzle/lng.py}{385}--389.
+
+\subsection{Residence time}
+
+Pressure samples are mapped to equally spaced axial positions. For segment length
+$\Delta z$ and average endpoint speed,
+
+\begin{equation}
+  \overline u_j=\max\left(0.5,\frac{u_j+u_{j+1}}{2}\right),
+  \qquad \Delta t_j=\frac{\Delta z}{\overline u_j}.
+  \label{eq:residence-step}
+\end{equation}
+
+The floor of $0.5\unit{m/s}$ prevents division by zero at the inlet. Implemented at
+\srcline{src/fuelnozzle/lng.py}{405}--408. Equation
+\eqref{eq:discrete-relaxation} is at lines 410--416.
+
+\subsection{Actual mixture density}
+
+For $x>0$, the code uses the homogeneous density from
+Equation~\eqref{eq:homogeneous-density}. For $x=0$, it retains compressed-liquid inlet
+density. Implemented by \code{_relaxed_mixture_density} at
+\srcline{src/fuelnozzle/lng.py}{539}--552.
+
+\subsection{Bounded mass flux}
+
+The direct estimate is $G_{raw}=\rho_{actual}u_{HEM}$. The implementation prevents
+this reduced model from leaving the HEM/SPI bracket:
+
+\begin{equation}
+  G_{Tier2}=\min\left[G_{SPI},\max\left(G_{HEM},G_{raw}\right)\right].
+  \label{eq:tier2-bounded-flux}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/lng.py}{428}--446.
+
+\warningbox{Tier 2 does not solve coupled mass, momentum, energy, and phase-relaxation
+equations. It relaxes quality along the Tier 1 pressure/velocity path and applies a
+physical bracket. It should be called a finite-rate screening model, not a validated
+full HRM solver.}
+
+\section{LNG Tier 3: Spray Regime and Calibration}
+
+\subsection{Pressure ratio, superheat, and Jakob number}
+
+The saturation-to-chamber pressure ratio is
+
+\begin{equation}
+  R_p=\frac{P_{bubble}(T_{in},\mathbf z)}{P_3}.
+  \label{eq:pressure-ratio}
+\end{equation}
+
+Superheat relative to the bubble temperature at $P_3$ is
+
+\begin{equation}
+  \Delta T_{sh}=\max\left(0,T_{in}-T_{bubble}(P_3,\mathbf z)\right).
+  \label{eq:superheat}
+\end{equation}
+
+Latent heat estimate and Jakob number are
+
+\begin{align}
+  h_{fg} &= h_{dew}(P_3)-h_{bubble}(P_3), \\
+  \mathrm{Ja} &= \frac{c_p\Delta T_{sh}}{h_{fg}}.
+  \label{eq:jakob}
+\end{align}
+
+Implemented by \code{solve_lng_flash_spray} at
+\srcline{src/fuelnozzle/spray.py}{102}; equations occur at lines 126--143.
+
+\subsection{Regime classifier}
+
+\code{_classify_regime} begins at \srcline{src/fuelnozzle/spray.py}{225}.
+The classifier first honors upstream, no-flash, and external-flash results from lower
+tiers. Remaining cases are fully flashing when any of these default conditions is true:
+
+\begin{equation}
+  x_{exit}\geq0.10 \quad\text{or}\quad R_p\geq3.0
+  \quad\text{or}\quad \mathrm{Ja}\geq0.10.
+  \label{eq:full-flash-threshold}
+\end{equation}
+
+Otherwise the case is transitional. These thresholds are exposed in
+\code{FlashSpraySettings} at \srcline{src/fuelnozzle/spray.py}{35}; they are not
+universal physical boundaries.
+
+\subsection{Calibrated LNG SMD}
+
+No SMD is produced without calibration. With a reference SMD, pressure ratio, and
+flash quality, the code uses
+
+\begin{equation}
+  D_{32}=D_{32,ref}
+  \left(\frac{R_p}{R_{p,ref}}\right)^{-a}
+  \left(\frac{x_{drive}}{x_{ref}}\right)^{-b},
+  \label{eq:lng-smd-calibration}
+\end{equation}
+
+where
+
+\begin{equation}
+  x_{drive}=\max\left(10^{-6},x_{exit},x_{eq,P3}\right).
+  \label{eq:driving-quality}
+\end{equation}
+
+The uncertainty interval is
+
+\begin{equation}
+  [D_{32}(1-U_D),\;D_{32}(1+U_D)].
+  \label{eq:lng-smd-range}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/spray.py}{168}--181.
+
+\subsection{Calibrated cone angle}
+
+The full cone-angle estimate is
+
+\begin{equation}
+  \Theta=\operatorname{clip}_{[0,180]}
+  \left[\Theta_{ref}+K_\Theta\ln\left(\frac{R_p}{R_{p,ref}}\right)\right].
+  \label{eq:lng-cone-calibration}
+\end{equation}
+
+The reported range adds and subtracts a calibration uncertainty and clips it to
+$[0,180]$ degrees. Implemented at
+\srcline{src/fuelnozzle/spray.py}{182}--189.
+
+\warningbox{Equations~\eqref{eq:lng-smd-calibration} and
+\eqref{eq:lng-cone-calibration} are calibration forms selected for transparent
+screening. They are not universal flash-atomization correlations.}
+
+\section{Jet-A Pressure-Swirl Model}
+
+\subsection{Jet-A properties}
+
+Jet-A is a variable mixture rather than one pure chemical. The code therefore accepts
+density, viscosity, surface tension, and optional vapor pressure from a measured or
+declared source. \code{JetAPropertyTable.at_temperature} linearly interpolates a
+monotonic temperature table at \srcline{src/fuelnozzle/jet_a.py}{64}. Outside the
+table it uses an endpoint and emits a warning.
+
+\subsection{Ideal speed and exit sizing}
+
+The Bernoulli ideal speed is
+
+\begin{equation}
+  u_{ideal}=\sqrt{\frac{2\Delta P_n}{\rho}}.
+  \label{eq:jet-ideal-velocity}
+\end{equation}
+
+The orifice relation is
+
+\begin{equation}
+  \dot m=C_d\rho A_o u_{ideal}
+  =C_d A_o\sqrt{2\rho\Delta P_n}.
+  \label{eq:jet-orifice-flow}
+\end{equation}
+
+Solving for area and diameter gives
+
+\begin{align}
+  A_{req}&=\frac{\dot m}{C_d\rho u_{ideal}}, \\
+  D_{req}&=\sqrt{\frac{4A_{req}}{\pi}}.
+  \label{eq:jet-sizing}
+\end{align}
+
+Implemented by \code{solve_jet_a_pressure_swirl} at
+\srcline{src/fuelnozzle/jet_a.py}{143}; equations occur at lines 168--180.
+
+\subsection{Tangential port velocity and angular momentum}
+
+For $N_p$ circular ports of diameter $D_p$,
+
+\begin{equation}
+  A_p=N_p\frac{\pi D_p^2}{4}, \qquad
+  u_p=\frac{\dot m}{\rho A_p}.
+  \label{eq:port-flow}
+\end{equation}
+
+A total exit speed is formed using velocity coefficient $C_v$:
+
+\begin{equation}
+  u_{tot}=C_v u_{ideal}.
+  \label{eq:total-exit-speed}
+\end{equation}
+
+The unconstrained tangential speed follows a simple angular-momentum transfer:
+
+\begin{equation}
+  u_{\theta,raw}=\eta_L u_p\frac{r_t}{r_o},
+  \label{eq:angular-momentum-closure}
+\end{equation}
+
+where $r_t$ is port tangency radius, $r_o$ is exit radius, and $\eta_L$ is an
+empirical efficiency. Implemented at \srcline{src/fuelnozzle/jet_a.py}{183}--193.
+
+The code caps tangential speed using total pressure energy and a minimum axial speed
+needed for continuity. Axial speed is then
+
+\begin{equation}
+  u_z=\sqrt{\max\left(10^{-12},u_{tot}^2-u_\theta^2\right)}.
+  \label{eq:axial-velocity}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{194}--217.
+
+\subsection{Air core and film thickness}
+
+The liquid annular area required by continuity is
+
+\begin{equation}
+  A_l=\frac{\dot m}{\rho u_z}.
+  \label{eq:liquid-annulus-area}
+\end{equation}
+
+For exit radius $r_o$, the air-core radius is
+
+\begin{equation}
+  r_a=\sqrt{r_o^2-\frac{A_l}{\pi}},
+  \label{eq:air-core-radius}
+\end{equation}
+
+and film thickness is
+
+\begin{equation}
+  t_f=r_o-r_a.
+  \label{eq:film-thickness}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{218}--234. If $A_l\geq A_o$,
+the code sets no air core and returns an error warning.
+
+\subsection{Cone angle}
+
+The nominal full cone angle is twice the velocity-vector semi-angle:
+
+\begin{equation}
+  \Theta=2\tan^{-1}\left(\frac{u_\theta}{u_z}\right).
+  \label{eq:jet-cone-angle}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{236}. This is simpler than a
+complete Abramovich/Giffen-Muraszewski internal-flow solution.
+
+\subsection{Cavitation screen}
+
+Centrifugal velocity is assumed to depress internal pressure by dynamic pressure:
+
+\begin{equation}
+  P_{min}=P_{n,in}-\frac{1}{2}\rho u_\theta^2.
+  \label{eq:jet-minimum-pressure}
+\end{equation}
+
+The vapor-pressure margin is
+
+\begin{equation}
+  \Delta P_{cav}=P_{min}-P_{vap}(T).
+  \label{eq:cavitation-margin}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{237}--244. Negative margin
+triggers an error-level warning. This is a screen, not a resolved cavitation model.
+
+\subsection{Dimensionless atomization groups}
+
+Using film thickness as length scale,
+
+\begin{align}
+  \mathrm{Re}_f &= \frac{\rho u_{tot}t_f}{\mu}, \\
+  \mathrm{We}_f &= \frac{\rho u_{tot}^2t_f}{\sigma}, \\
+  \mathrm{Oh}_f &= \frac{\mu}{\sqrt{\rho\sigma t_f}}.
+  \label{eq:jet-dimensionless}
+\end{align}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{262}--275.
+Reynolds number compares inertia to viscosity, Weber number compares inertia to
+surface tension, and Ohnesorge number compares viscosity to inertial-capillary forces.
+
+Ambient air density is estimated as an ideal gas:
+
+\begin{equation}
+  \rho_a=\frac{P_3}{R_aT_3}, \qquad R_a=287.05\unit{J/(kg\,K)}.
+  \label{eq:ambient-air-density}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{276}--278.
+
+\subsection{Calibrated Jet-A SMD}
+
+The code defines a capillary sheet scale
+
+\begin{equation}
+  \ell_c=\sqrt{\frac{\sigma t_f}{\rho u_{tot}^2}}
+  \label{eq:capillary-sheet-scale}
+\end{equation}
+
+and calibrated SMD
+
+\begin{equation}
+  D_{32}=C_{SMD}\ell_c(1+3\mathrm{Oh}_f).
+  \label{eq:jet-smd-calibration}
+\end{equation}
+
+Implemented at \srcline{src/fuelnozzle/jet_a.py}{294}--303. No SMD is returned
+unless $C_{SMD}$ is supplied.
+
+\warningbox{The current geometry fields for swirl-chamber radius, swirl-chamber
+length, and exit-orifice length are validated inputs but do not enter the hydraulic
+equations. A future named pressure-swirl model must use them or remove them from the
+claimed physics.}
+
+\section{Mission-Level Integration}
+
+If every operating point has duration $\Delta t_i$ and multiplier $N_i$, integrated
+fuel mass is
+
+\begin{equation}
+  m_f=\sum_i \dot m_{f,i}\Delta t_i N_i.
+  \label{eq:mission-mass}
+\end{equation}
+
+Implemented by \code{_integrate_fuel_masses} at
+\srcline{src/fuelnozzle/study.py}{170}; Jet-A and LNG sums are lines 175--184.
+
+For external mission total $m_{ref}$, mismatch is
+
+\begin{equation}
+  e_{rel}=\frac{|m_f-m_{ref}|}{\max(m_{ref},10^{-12})}.
+  \label{eq:mission-relative-error}
+\end{equation}
+
+Implemented by \code{_mission_mass_warnings} at
+\srcline{src/fuelnozzle/study.py}{188}, equation at line 199. The default warning
+tolerance is 5\%.
+
+\section{Complete Function-to-Source Map}
+
+\footnotesize
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.31\textwidth}
+                  >{\raggedright\arraybackslash}p{0.22\textwidth}
+                  >{\raggedright\arraybackslash}p{0.39\textwidth}}
+\toprule
+Function or class & Source start & Responsibility \\
+\midrule
+\endfirsthead
+\toprule
+Function or class & Source start & Responsibility \\
+\midrule
+\endhead
+\code{OperatingPoint} & \srcline{src/fuelnozzle/operating.py}{12} & Per-stage user inputs \\
+\code{fuel_pressure_budget} & \srcline{src/fuelnozzle/operating.py}{55} & Pump/feed/nozzle pressure closure \\
+\code{LNGComposition} & \srcline{src/fuelnozzle/models.py}{28} & Normalize LNG composition \\
+\code{CoolPropLNGProvider.__init__} & \srcline{src/fuelnozzle/properties.py}{29} & Reusable EOS state creation \\
+\code{state_pt} & \srcline{src/fuelnozzle/properties.py}{60} & Pressure-temperature flash \\
+\code{state_ph} & \srcline{src/fuelnozzle/properties.py}{72} & Pressure-enthalpy flash/root \\
+\code{state_ps} & \srcline{src/fuelnozzle/properties.py}{96} & Pressure-entropy flash/root \\
+\code{state_pq} & \srcline{src/fuelnozzle/properties.py}{120} & Pressure-quality saturation state \\
+\code{state_tq} & \srcline{src/fuelnozzle/properties.py}{132} & Temperature-quality saturation state \\
+\code{_mixture_target_state} & \srcline{src/fuelnozzle/properties.py}{152} & Bracketed mixture PH/PS root \\
+\code{_component_transport_fallback} & \srcline{src/fuelnozzle/properties.py}{281} & Approximate missing mixture transport \\
+\code{_mass_quality} & \srcline{src/fuelnozzle/properties.py}{370} & Convert molar to mass quality \\
+\code{solve_lng_feed_line} & \srcline{src/fuelnozzle/feed.py}{63} & Segmented cryogenic feed solver \\
+\code{_heat_leak_per_length} & \srcline{src/fuelnozzle/feed.py}{230} & Measured or calculated heat ingress \\
+\code{_liquid_segment_pressure_drop} & \srcline{src/fuelnozzle/feed.py}{270} & Single-phase friction/minor/static loss \\
+\code{_two_phase_segment_pressure_drop} & \srcline{src/fuelnozzle/feed.py}{297} & ChEDL two-phase friction and static loss \\
+\code{screen_lng_flash} & \srcline{src/fuelnozzle/lng.py}{151} & Tier 0 equilibrium phase screen \\
+\code{solve_lng_equilibrium_flow} & \srcline{src/fuelnozzle/lng.py}{256} & Tier 1 SPI/HEM sizing and choking \\
+\code{solve_lng_relaxation_flow} & \srcline{src/fuelnozzle/lng.py}{363} & Tier 2 finite-rate flashing screen \\
+\code{_relaxed_mixture_density} & \srcline{src/fuelnozzle/lng.py}{539} & Homogeneous actual-quality density \\
+\code{solve_lng_flash_spray} & \srcline{src/fuelnozzle/spray.py}{102} & Tier 3 spray outputs and calibration \\
+\code{_classify_regime} & \srcline{src/fuelnozzle/spray.py}{225} & Rule-based flash-spray class \\
+\code{JetAPropertyTable.at_temperature} & \srcline{src/fuelnozzle/jet_a.py}{64} & Jet-A property interpolation \\
+\code{solve_jet_a_pressure_swirl} & \srcline{src/fuelnozzle/jet_a.py}{143} & Jet-A hydraulic and spray screen \\
+\code{run_nozzle_study} & \srcline{src/fuelnozzle/study.py}{75} & Whole-envelope orchestration \\
+\code{_integrate_fuel_masses} & \srcline{src/fuelnozzle/study.py}{170} & Stage-to-mission fuel integration \\
+\code{_mission_mass_warnings} & \srcline{src/fuelnozzle/study.py}{188} & External mission consistency check \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Existing Verification Coverage}
+
+The current suite has 21 tests. The main test starts are:
+
+\begin{itemize}
+  \item properties: \srcline{tests/test_properties.py}{7}, 19, and 51;
+  \item feed line: \srcline{tests/test_feed.py}{31} and 48;
+  \item LNG Tier 0/1: \srcline{tests/test_lng_equilibrium.py}{37}, 50, 63, and 81;
+  \item LNG Tier 2: \srcline{tests/test_lng_relaxation.py}{36}, 52, and 72;
+  \item LNG Tier 3: \srcline{tests/test_spray.py}{35}, 54, and 80;
+  \item Jet-A: \srcline{tests/test_jet_a.py}{41}, 67, and 83;
+  \item full study: \srcline{tests/test_study.py}{47}, 70, and 86.
+\end{itemize}
+
+These tests confirm code paths, round trips, bounds, warning behavior, and basic limiting
+cases. Required next verification includes pressure-grid convergence, Tier 2 axial-grid
+convergence, independent analytical values, energy/momentum residuals, and property tables.
+
+\section{Validation Evidence and Planned Use}
+
+\subsection{Critical flow}
+
+Hammer et al.~\cite{hammer2022} provide modern CO2 orifice/nozzle choking data.
+CO2 is not an LNG surrogate; it tests the HEM and non-equilibrium mathematical
+structure for a strongly real fluid.
+
+De Lorenzo et al.~\cite{delorenzo2017} benchmark delayed-equilibrium and classic
+critical-flow models against multiple water experiments, including Super Moby Dick.
+This is the primary source for testing relaxation-model behavior.
+
+Kim and O'Neal~\cite{kimoneal1995} and the Payne/O'Neal compilation provide
+short-orifice refrigerant evidence for metastability and geometry dependence.
+
+\subsection{Cryogenic spray}
+
+DaRUS-2527~\cite{darus2527} contains 22 LN2 shadowgraph cases and condition data.
+It is the preferred Tier 3 regime/angle dataset. Rees et al.~\cite{reesmorphology}
+provide interpretation.
+
+DaRUS-2076~\cite{darus2076} and Rees et al.~\cite{rees2020} provide raw local
+$D_{10}$ and velocity data. These validate cryogenic spray fields but do not directly
+validate LNG $D_{32}$.
+
+Gaertner et al.~\cite{gaertner2020} provide a numerical/experimental cryogenic
+comparison. The correct article number is 103360.
+
+\subsection{Pressure swirl and Jet-A}
+
+Lacava et al.~\cite{lacava2004} provide a complete, open, four-port water atomizer
+benchmark. At the 4-atm design point the reported experimental values are
+$\dot m=6.13\unit{g/s}$, $C_d=0.2728$, semi-angle $34.5^\circ$, and
+$D_{32}=80.83\unit{\mu m}$. Water data verify model form, not Jet-A transfer.
+
+Dodge and Biaglow~\cite{dodge1986} provide direct Jet-A SMD and distribution trends
+with elevated air pressure and temperature. The NASA record is metadata-only, so a
+full paper must be transcribed before quantitative tests are created.
+
+\section{Known Deviations and Technical Debt}
+
+\begin{enumerate}
+  \item $P_3$ is treated as nozzle back pressure; no separate liner pressure loss exists.
+  \item The feed model is steady and uniform. It omits pump dynamics, valve transients,
+  conjugate transient wall storage, and a separate two-phase acceleration loss.
+  \item Tier 0 onset position assumes a linear pressure profile.
+  \item Tier 1 samples an isentropic thermodynamic path; it does not solve an
+  area/friction-coupled nozzle differential equation.
+  \item Choking is a sampled mass-flux maximum rather than an explicit sonic condition.
+  \item Tier 2 is a quality-relaxation screen on the Tier 1 path, not a full HRM PDE/ODE
+  conservation solver.
+  \item Tier 2 mass flux is clamped to HEM/SPI bounds. This is a guardrail, not a derived
+  non-equilibrium critical-flow law.
+  \item Tier 3 regime thresholds and calibrated SMD/cone equations require validation.
+  \item LNG transport mixing is approximate where CoolProp has no native mixture model.
+  \item Jet-A swirl chamber radius, chamber length, and exit length are not yet used by
+  the hydraulic closure.
+  \item The Jet-A cone angle uses a velocity-vector approximation rather than a complete
+  pressure-swirl theory.
+  \item No automated parameter uncertainty propagation is implemented.
+  \item No direct adapter to the separate mission repository is implemented; only generic
+  operating points and mission-total checks are supported.
+  \item CFD export is an in-memory boundary record, not a solver-specific file writer.
+\end{enumerate}
+
+\section{Recommended Next Steps}
+
+\begin{enumerate}
+  \item Add numerical-convergence tests before fitting any empirical parameter.
+  \item Create immutable raw-data and derived-data folders with source checksums.
+  \item Transcribe one Hammer CO2 orifice series and all Lacava curves first.
+  \item Generalize the property protocol so the same Tier 1 kernel can run CO2, R134a,
+  water, nitrogen, methane, and LNG without changing equations.
+  \item Fit Tier 2 on declared training cases and evaluate held-out geometries/states.
+  \item Load DaRUS datasets directly rather than digitizing available CSV/XLSX values.
+  \item Add named pressure-swirl correlation adapters and use currently unused geometry.
+  \item Add direct LCH4/LNG validation only when composition, inlet state, geometry,
+  back pressure, mass flow, and uncertainty are all available.
+\end{enumerate}
+
+\section{Building This Report}
+
+The project uses Tectonic through Pixi:
+
+\begin{verbatim}
+pixi install
+pixi run doc
+\end{verbatim}
+
+The task is defined in \code{pixi.toml}. Tectonic downloads required TeX packages and
+writes the PDF next to this source file.
+
+\begin{thebibliography}{99}
+
+\bibitem{setzmann1991}
+U. Setzmann and W. Wagner,
+``A New Equation of State and Tables of Thermodynamic Properties for Methane
+Covering the Range from the Melting Line to 625 K at Pressures up to 1000 MPa,''
+\emph{Journal of Physical and Chemical Reference Data}, vol. 20, no. 6,
+pp. 1061--1155, 1991.
+\url{https://doi.org/10.1063/1.555898}.
+
+\bibitem{bell2014}
+I. H. Bell et al.,
+``Pure and Pseudo-pure Fluid Thermophysical Property Evaluation and the
+Open-Source Thermophysical Property Library CoolProp,''
+\emph{Industrial \& Engineering Chemistry Research}, vol. 53, 2014.
+\url{https://doi.org/10.1021/ie4033999}.
+
+\bibitem{hammer2022}
+M. Hammer, H. Deng, A. Austegard, A. M. Log, and S. T. Munkejord,
+``Experiments and modelling of choked flow of CO2 in orifices and nozzles,''
+\emph{International Journal of Multiphase Flow}, vol. 156, article 104201, 2022.
+\url{https://doi.org/10.1016/j.ijmultiphaseflow.2022.104201}.
+
+\bibitem{delorenzo2017}
+M. De Lorenzo, Ph. Lafon, J.-M. Seynhaeve, and Y. Bartosiewicz,
+``Benchmark of Delayed Equilibrium Model (DEM) and classic two-phase critical
+flow models against experimental data,''
+\emph{International Journal of Multiphase Flow}, vol. 92, pp. 112--130, 2017.
+\url{https://doi.org/10.1016/j.ijmultiphaseflow.2017.03.004}.
+
+\bibitem{kimoneal1995}
+Y. Kim and D. L. O'Neal,
+``A comparison of critical flow models for estimating two-phase flow of HCFC22
+and HFC134a through short-tube orifices,''
+\emph{International Journal of Refrigeration}, 1995.
+\url{https://doi.org/10.1016/0140-7007(95)93785-I}.
+
+\bibitem{darus2527}
+A. Rees and M. Oschwald,
+``Evolution of flash boiling liquid nitrogen sprays by means of high-speed
+shadowgraphy,'' DaRUS, V1, 2022.
+\url{https://doi.org/10.18419/DARUS-2527}.
+
+\bibitem{reesmorphology}
+A. Rees, H. Salzmann, J. Sender, and M. Oschwald,
+``About the Morphology of Flash Boiling Liquid Nitrogen Sprays,''
+\emph{Atomization and Sprays}, vol. 30, no. 10, pp. 713--740, 2020.
+\url{https://doi.org/10.1615/AtomizSpr.2020035265}.
+
+\bibitem{darus2076}
+A. Rees and M. Oschwald,
+``Experimental data of flash boiling liquid nitrogen sprays (Test Case IN-1),''
+DaRUS, V1, 2021.
+\url{https://doi.org/10.18419/DARUS-2076}.
+
+\bibitem{rees2020}
+A. Rees, L. Araneo, H. Salzmann, G. Lamanna, J. Sender, and M. Oschwald,
+``Droplet velocity and diameter distributions in flash boiling liquid nitrogen
+jets by means of phase Doppler diagnostics,''
+\emph{Experiments in Fluids}, vol. 61, article 182, 2020.
+\url{https://doi.org/10.1007/s00348-020-03020-7}.
+
+\bibitem{gaertner2020}
+J. W. Gaertner, A. Kronenburg, A. Rees, J. Sender, M. Oschwald, and G. Lamanna,
+``Numerical and experimental analysis of flashing cryogenic nitrogen,''
+\emph{International Journal of Multiphase Flow}, vol. 130, article 103360, 2020.
+\url{https://doi.org/10.1016/j.ijmultiphaseflow.2020.103360}.
+
+\bibitem{lacava2004}
+P. T. Lacava, D. Bastos-Netto, and A. P. Pimenta,
+``Design Procedure and Experimental Evaluation of Pressure-Swirl Atomizers,''
+24th International Congress of the Aeronautical Sciences, 2004.
+\url{https://www.icas.org/icas_archive/ICAS2004/PAPERS/097.PDF}.
+
+\bibitem{dodge1986}
+L. G. Dodge and J. A. Biaglow,
+``Effect of elevated temperature and pressure on sprays from simplex swirl
+atomizers,'' \emph{Journal of Engineering for Gas Turbines and Power},
+vol. 108, ASME paper 85-GT-58, 1986.
+\url{https://ntrs.nasa.gov/citations/19860037997}.
+
+\end{thebibliography}
+
+\end{document}
