@@ -25,6 +25,14 @@ class JetAProperties(BaseModel):
     vapor_pressure_pa: float | None = Field(default=None, ge=0.0)
     source: str = Field(min_length=1)
 
+    # Properties required only by the reactor-network droplet models. The hydraulic
+    # nozzle calculation does not use them, so they default to None and every existing
+    # caller is unaffected.
+    liquid_cp_j_kg_k: float | None = Field(default=None, gt=0.0)
+    latent_heat_j_kg: float | None = Field(default=None, gt=0.0)
+    molecular_weight_kg_mol: float | None = Field(default=None, gt=0.0)
+    boiling_point_k: float | None = Field(default=None, gt=0.0)
+
 
 class JetAPropertyTable(BaseModel):
     """Temperature-indexed measured Jet-A properties with linear interpolation."""
@@ -38,6 +46,12 @@ class JetAPropertyTable(BaseModel):
     vapor_pressure_pa: tuple[float, ...] | None = None
     source: str = Field(min_length=1)
 
+    # Optional droplet-model columns; see JetAProperties.
+    liquid_cp_j_kg_k: tuple[float, ...] | None = None
+    latent_heat_j_kg: tuple[float, ...] | None = None
+    molecular_weight_kg_mol: float | None = Field(default=None, gt=0.0)
+    boiling_point_k: float | None = Field(default=None, gt=0.0)
+
     @model_validator(mode="after")
     def validate_table(self) -> JetAPropertyTable:
         count = len(self.temperature_k)
@@ -48,6 +62,16 @@ class JetAPropertyTable(BaseModel):
             raise ValueError("All Jet-A property arrays must have the same length")
         if self.vapor_pressure_pa is not None and len(self.vapor_pressure_pa) != count:
             raise ValueError("Jet-A vapor-pressure array must match the temperature array")
+        for label, optional in (
+            ("liquid specific heat", self.liquid_cp_j_kg_k),
+            ("latent heat", self.latent_heat_j_kg),
+        ):
+            if optional is None:
+                continue
+            if len(optional) != count:
+                raise ValueError(f"Jet-A {label} array must match the temperature array")
+            if any(value <= 0.0 for value in optional):
+                raise ValueError(f"Jet-A {label} values must be positive")
         if any(
             right <= left
             for left, right in zip(self.temperature_k, self.temperature_k[1:], strict=False)
@@ -76,18 +100,20 @@ class JetAPropertyTable(BaseModel):
         def interpolate(values: tuple[float, ...]) -> float:
             return float(np.interp(temperature_k, self.temperature_k, values))
 
-        vapor_pressure = (
-            interpolate(self.vapor_pressure_pa)
-            if self.vapor_pressure_pa is not None
-            else None
-        )
+        def interpolate_optional(values: tuple[float, ...] | None) -> float | None:
+            return interpolate(values) if values is not None else None
+
         return (
             JetAProperties(
                 density_kg_m3=interpolate(self.density_kg_m3),
                 viscosity_pa_s=interpolate(self.viscosity_pa_s),
                 surface_tension_n_m=interpolate(self.surface_tension_n_m),
-                vapor_pressure_pa=vapor_pressure,
+                vapor_pressure_pa=interpolate_optional(self.vapor_pressure_pa),
                 source=self.source,
+                liquid_cp_j_kg_k=interpolate_optional(self.liquid_cp_j_kg_k),
+                latent_heat_j_kg=interpolate_optional(self.latent_heat_j_kg),
+                molecular_weight_kg_mol=self.molecular_weight_kg_mol,
+                boiling_point_k=self.boiling_point_k,
             ),
             tuple(warnings),
         )

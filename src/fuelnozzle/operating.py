@@ -39,6 +39,37 @@ class OperatingPoint(BaseModel):
     jet_a_nozzle_inlet_temperature_k: float = Field(gt=0.0)
     jet_a_nozzle_pressure_drop_pa: float = Field(gt=0.0)
 
+    # Combustor-side inputs, used only by the reactor-network models. All optional, so
+    # existing nozzle-only studies are unaffected.
+    combustor_air_mass_flow_kg_s: float | None = Field(default=None, gt=0.0)
+    overall_equivalence_ratio: float | None = Field(default=None, gt=0.0)
+    liner_pressure_loss_fraction: float | None = Field(default=None, ge=0.0, lt=1.0)
+    rated_thrust_kn: float | None = Field(default=None, gt=0.0)
+    thrust_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
+    nozzle_wall_temperature_k: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Wall temperature seen by the fuel circuit that is shut off, used "
+        "for the idle-circuit coking and vapour-lock screen.",
+    )
+
+
+    @property
+    def active_fuel(self) -> str | None:
+        """Which fuel this point burns, or ``None`` if both or neither flow.
+
+        One fuel is active per operating point by design. A point with both flowing is
+        not rejected here, because the nozzle models predate that rule and may legitimately
+        size both circuits, but the reactor-network models require a single answer.
+        """
+        lng = self.lng_mass_flow_kg_s > 0.0
+        jet_a = self.jet_a_mass_flow_kg_s > 0.0
+        if lng and not jet_a:
+            return "lng"
+        if jet_a and not lng:
+            return "jet_a"
+        return None
+
 
 @dataclass(frozen=True)
 class PressureBudget:

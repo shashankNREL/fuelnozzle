@@ -15,6 +15,9 @@ pytest = ">=8.3"
 pytest-cov = ">=6.0"
 ruff = ">=0.9"
 tectonic = ">=0.15"
+cantera = ">=3.2.0,<4"
+matplotlib = ">=3.11.1,<4"
+pyyaml = ">=6.0.3,<7"
 
 [pypi-dependencies]
 fuelnozzle = { path = ".", editable = true }
@@ -26,4 +29,7 @@ lint = "ruff check src tests examples"
 format = "ruff format src tests examples"
 check = { depends-on = ["lint", "test"] }
 example = "python examples/run_study.py"
-doc = "tectonic docs/technical_reference.tex --keep-logs"
+example-combustor = "python examples/run_combustor_study.py"
+doc-nozzle = "tectonic docs/technical_reference.tex --keep-logs"
+doc-crn = "tectonic docs/crn_technical_reference.tex --keep-logs"
+doc = { depends-on = ["doc-nozzle", "doc-crn"] }

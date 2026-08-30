@@ -1,0 +1,1001 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{xurl}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!65!black,
+  citecolor=green!40!black,
+  pdftitle={Dual-Fuel Reactor Network Technical Reference},
+  pdfauthor={fuelnozzle project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Dual-Fuel Reactor Network Reference}
+\rhead{Version 0.1.0}
+\cfoot{\thepage}
+
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\srcline}[2]{\nolinkurl{#1:#2}}
+\newcommand{\unit}[1]{\,\mathrm{#1}}
+\setlength{\emergencystretch}{3em}
+\newcommand{\warningbox}[1]{%
+  \begin{center}
+  \fcolorbox{orange!60!black}{orange!8}{%
+    \parbox{0.91\textwidth}{\textbf{Engineering caution.} #1}}
+  \end{center}}
+
+\title{Dual-Fuel Reactor Network Technical Reference\\
+\large Jet-A and LNG Combustor Modeling for Nozzle and Architecture Design\\
+\large Beginner-Oriented Equations, Algorithms, Source Locations, and Limitations}
+\author{fuelnozzle project}
+\date{Draft, in progress}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report explains the equations and software implementation of the reactor-network
+extension to the \code{fuelnozzle} package, for a reader with no prior background in
+combustion, chemical kinetics, spray physics, or Python. The extension takes the output
+of the Jet-A pressure-swirl and flashing-LNG nozzle models and carries it into the
+combustor, so that emissions, temperature, mixing, and autoignition risk can be estimated
+without a three-dimensional simulation. Its purpose is to support the design of a
+dual-fuel combustor that burns Jet-A during landing and take-off and LNG during cruise,
+with separate injector hardware for each fuel and a shared combustor. Every major
+equation is connected to the Python function that implements it, and physical law,
+numerical approximation, and empirical calibration are kept visibly separate throughout.
+This is documentation for a reduced-order screening and design-exploration tool, not a
+certification method.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Status of This Document}
+
+This document is written alongside the implementation, section by section, as each
+module is completed. Sections marked \emph{pending} are planned but not yet written,
+and their absence means the corresponding code does not exist yet either.
+
+The companion documents are:
+
+\begin{itemize}
+  \item \code{docs/CRN_PLAN.md}, the design intent, task list, and risk register;
+  \item \code{docs/CRN_IMPLEMENTATION_LOG.md}, the build record, deviations from the
+        plan, and verification evidence;
+  \item \code{docs/technical_reference.tex}, the equivalent reference for the nozzle
+        models that this extension consumes;
+  \item \code{mech/README.md}, the kinetic mechanism registry and provenance.
+\end{itemize}
+
+\section{How to Read This Report}
+\emph{Pending.} Will follow the structure of the nozzle technical reference: separating
+what is a physical law, what is a numerical approximation, what is an empirical
+calibration, and what is simply unmodeled.
+
+\section{Basic Vocabulary for a New Reader}
+\emph{Pending.} Reactors, residence time, equivalence ratio, ignition delay, emission
+index, and the difference between a reactor network and a computational fluid dynamics
+simulation.
+
+\section{Why a Reactor Network, and What It Cannot Do}
+\emph{Pending.}
+
+\section{Kinetic Mechanisms}
+
+\subsection{What a mechanism is}
+
+A \emph{chemical kinetic mechanism} is a list of the molecules a fuel can turn into and
+the reactions that convert one into another, each with a rate. Burning a hydrocarbon is
+not one reaction but hundreds acting at once, so the mechanism is a file, not a formula.
+The files used here contain 47 to 71 chemical species and 247 to 538 reactions.
+
+Two properties of a mechanism matter for this work. First, whether it contains
+\emph{nitrogen chemistry}: without species such as NO and NO$_2$, the mechanism cannot
+produce oxides of nitrogen at all. Second, whether it contains \emph{low-temperature
+chemistry}: the slow reactions that determine how long a fuel-air mixture can sit at
+moderate temperature before it ignites on its own.
+
+\subsection{Why Jet-A needs two mechanisms}
+
+Neither available Jet-A file has both properties, and this tool needs both.
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+File & Species & Nitrogen chemistry & Low-temperature chemistry \\
+\midrule
+\code{A2NOx_skeletal}  & 71 & yes & no  \\
+\code{A2NTCfast_ske}   & 47 & no  & yes \\
+\code{gri30} (LNG)     & 53 & yes & n/a \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+It would be convenient to use the nitrogen-bearing file for everything. The following
+measurement, made during implementation, shows why that would be unsafe. The table gives
+the ignition delay predicted by each Jet-A mechanism at conditions representative of a
+premixing passage, expressed as the ratio between them.
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Pressure & 700 K & 800 K & 900 K & 1000 K \\
+\midrule
+20 atm & $510\times$ & $71\times$ & $9.3\times$ & $2.0\times$ \\
+40 atm & $490\times$ & $86\times$ & $13.5\times$ & $2.9\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Compressor discharge temperature at landing and take-off is roughly 700 to 900~K.
+In that range the high-temperature-only mechanism predicts an ignition delay one to two
+orders of magnitude longer than the mechanism that includes low-temperature chemistry.
+
+\warningbox{An ignition delay that is predicted too long makes a premixing passage look
+safe when it is not. This tool therefore uses \code{A2NOx_skeletal} for the reactor
+network and all NO$_x$ output, and \code{A2NTCfast_ske} only for ignition delay. Each
+result records which mechanism produced it.}
+
+\subsection{A distinction that is easy to get wrong}
+
+Some hydrocarbons show a \emph{negative temperature coefficient}: a temperature band in
+which raising the temperature makes ignition take \emph{longer}, contrary to intuition.
+Measured for \code{A2NTCfast_ske}, that band is clear at 5~atm between roughly 800
+and 950~K, weak at 10~atm, and gone by 20 to 40~atm.
+
+It is tempting to conclude that low-temperature chemistry stops mattering at combustor
+pressure. It does not. The $510\times$ measurements above were made at 20 and
+40~atm, where the non-monotonic shape has already disappeared. What vanishes at
+high pressure is the \emph{shape} of the curve, not the \emph{influence} of the
+low-temperature reactions on the absolute delay. These are two different statements.
+
+\subsection{Nitrogen pathway coverage differs between fuels}
+
+Nitric oxide forms by several competing routes. The two mechanisms in use do not cover
+the same set, and neither contains the other.
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Route & \code{A2NOx_skeletal} (Jet-A) & \code{gri30} (LNG) \\
+\midrule
+Thermal (Zeldovich) & yes & yes \\
+N$_2$O route & yes & yes \\
+Prompt via NCN (modern) & \textbf{yes} & no \\
+Prompt via HCN (older) & yes & yes \\
+NNH route & \textbf{no} & \textbf{yes} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each mechanism happens to carry the route most important to its own regime: prompt NO
+matters in the rich zones where Jet-A burns, and the NNH route matters in the lean
+premixed conditions where LNG burns. That is fortunate, but it is not a reason to ignore
+it.
+
+\warningbox{Because the two fuels use mechanisms with different pathway coverage,
+\emph{absolute} NO$_x$ values are not strictly comparable between Jet-A and LNG. The
+design metric defined later compares each fuel only against itself, which avoids this
+problem entirely.}
+
+Rather than demanding a fixed species list, the code records which routes each mechanism
+carries and attaches that record to every result. A hard requirement for NNH would
+wrongly reject the Jet-A mechanism, which is otherwise the better of the two. Implemented
+by \code{nox_pathway_coverage} in \code{src/fuelnozzle/crn/chemistry.py}.
+
+\subsection{What is checked, and what merely warns}
+
+A missing nitrogen submodel \emph{raises an error} rather than issuing a warning. Such a
+mechanism reports exactly zero NO with no other symptom, so a warning could be missed and
+the resulting zeros believed. The same applies to a fuel species absent from the
+mechanism, and to an LNG component that the mechanism cannot represent: dropping a
+component would silently change the fuel being modeled.
+
+Conditions outside a mechanism's declared validity range produce warnings rather than
+errors, because extrapolation is sometimes the only option and the user is entitled to
+make that choice knowingly. GRI-Mech 3.0 was optimized against data up to roughly
+10~atm; at combustor pressures of 10 to 40~atm every LNG result carries a
+warning to that effect. Implemented by \code{validate_mechanism}.
+
+\section{Air-Side Bookkeeping and Equivalence Ratio}
+
+\subsection{Equivalence ratio}
+
+The \emph{equivalence ratio} $\phi$ says how rich or lean a mixture is. It is the actual
+fuel-to-air mass ratio divided by the ratio that would consume both exactly:
+
+\begin{equation}
+  \phi=\frac{\left(\dot m_{f}/\dot m_{a}\right)}
+            {\left(\dot m_{f}/\dot m_{a}\right)_{\mathrm{stoich}}}
+       =\frac{\dot m_{f}\,\mathrm{AFR}_{\mathrm{stoich}}}{\dot m_{a}}.
+  \label{eq:equivalence-ratio}
+\end{equation}
+
+$\phi<1$ is lean, $\phi=1$ is stoichiometric, and $\phi>1$ is rich. Peak temperature, and
+therefore most NO$_x$, occurs slightly rich of stoichiometric.
+
+Computing $\phi$ by counting unburned fuel and air fails once reaction has started, since
+the fuel is gone but the mixture has not changed identity. The code therefore uses an
+\emph{element-based} definition, which counts carbon, hydrogen, and oxygen atoms rather
+than molecules and so remains correct in burned, partially burned, and evaporating
+mixtures alike. The related \emph{Bilger mixture fraction} $Z$ measures the same thing on
+a scale running from 0 in pure air to 1 in pure fuel, and the two are related through the
+stoichiometric mixture fraction $Z_{st}$:
+
+\begin{equation}
+  \phi=\frac{Z}{1-Z}\cdot\frac{1-Z_{st}}{Z_{st}},
+  \qquad Z_{st}=\frac{1}{1+\mathrm{AFR}_{\mathrm{stoich}}}.
+  \label{eq:phi-from-z}
+\end{equation}
+
+Both are evaluated by Cantera's own routines rather than reimplemented here. Verified
+against hand calculation: methane gives $\mathrm{AFR}_{\mathrm{stoich}}=17.13$ and the
+Jet-A surrogate C$_{11}$H$_{22}$ gives $14.69$, and Equation~\eqref{eq:phi-from-z}
+reproduces a prescribed $\phi$ to six decimal places.
+
+\subsection{Where the air goes}
+
+Combustor air does not all enter at one place. It is divided among the dome, the primary
+zone, quench jets, dilution jets, and liner cooling films:
+
+\begin{equation}
+  f_{\mathrm{dome}}+f_{\mathrm{primary}}+f_{\mathrm{quench}}
+  +f_{\mathrm{dilution}}+f_{\mathrm{cooling}}=1.
+  \label{eq:air-split}
+\end{equation}
+
+The code refuses a split that does not satisfy Equation~\eqref{eq:air-split} rather than
+renormalizing it, because a split that does not sum to one usually means a station was
+forgotten, and silently rescaling would hide the mistake.
+
+\subsection{The inactive circuit, and why it is a design lever}
+
+Jet-A and LNG have separate injectors. Air flows through \emph{both} injector air
+passages at all times, including the one whose fuel is shut off. If the Jet-A passage
+carries a share $a_J$ of the dome air and the LNG passage carries $a_L$, with
+$a_J+a_L=f_{\mathrm{dome}}$, then the air setting the equivalence ratio near the flame
+depends on which fuel is burning:
+
+\begin{equation}
+  f_{\mathrm{near}}(\text{fuel})=a_{\mathrm{active}}
+  +\chi\,a_{\mathrm{idle}},
+  \label{eq:near-field-air}
+\end{equation}
+
+where $\chi\in[0,1]$ is the fraction of the idle passage's unfueled air that actually
+reaches the near field.
+
+Equation~\eqref{eq:near-field-air} is the reason a single combustor may be able to run
+rich for Jet-A and lean for LNG. Making $a_J$ small and $a_L$ large produces a rich Jet-A
+near field and a lean LNG near field with no moving parts and no change in hole area.
+
+\warningbox{The strength of this effect depends entirely on $\chi$, and a reactor network
+cannot determine $\chi$ --- it is a mixing question that requires computational fluid
+dynamics or an experiment. Every result that depends on it is reported with a sensitivity
+across the full range $\chi\in[0,1]$, never at a single assumed value. At $\chi=0$ the
+lever is at full strength; at $\chi=1$ it disappears entirely.}
+
+Implemented by \code{AirSplit} and \code{resolve_air_streams} in
+\code{src/fuelnozzle/crn/streams.py}.
+
+\subsection{Reporting emissions}
+
+Raw concentrations are not comparable between combustors, because a leaner combustor
+dilutes its own exhaust. Two conventional corrections are applied. The \emph{emission
+index} expresses output per unit of fuel burned,
+
+\begin{equation}
+  \mathrm{EI}_i=1000\,\frac{Y_i\,\dot m_{\mathrm{exhaust}}}{\dot m_{\mathrm{fuel}}}
+  \quad[\mathrm{g/kg}],
+  \label{eq:emission-index}
+\end{equation}
+
+and concentrations are quoted dry, with water removed, corrected to a reference oxygen
+level of 15\%:
+
+\begin{equation}
+  \mathrm{ppmv}_{15\%}=10^{6}\,X_i^{\mathrm{dry}}\,
+  \frac{20.9-15}{20.9-X_{\mathrm{O_2}}^{\mathrm{dry}}\times100}.
+  \label{eq:o2-correction}
+\end{equation}
+
+Equation~\eqref{eq:o2-correction} is undefined when the measured oxygen approaches that
+of air, which happens as combustion approaches extinction; the code raises rather than
+returning a large meaningless number.
+
+\section{Spray Boundary: Connecting the Nozzle to the Network}
+
+A spray is described to the network by how much fuel arrives as vapor, and by a set of
+\emph{droplet classes}: groups of droplets sharing a size, temperature, and velocity.
+The number of droplets follows from the liquid mass flow and the mass of one droplet,
+
+\begin{equation}
+  \dot N_d=\frac{\dot m_{\ell}}{\rho_{\ell}\,\tfrac{4}{3}\pi r_0^{3}}.
+  \label{eq:number-rate}
+\end{equation}
+
+For LNG, part of the fuel has already flashed to vapor inside the nozzle. Only the
+remainder becomes droplets. Treating all of it as liquid would ask the model to perform
+atomization work the flash has already done.
+
+\subsection{Where the initial size comes from}
+
+Three policies are available. The default takes the initial radius as half the Sauter
+mean diameter from the nozzle model, which uses information the reference paper did not
+have, since it solves the atomizer separately. The second follows the paper: start at the
+orifice radius and let aerodynamic breakup find the size. The third is an explicit
+user-supplied value.
+
+\warningbox{The existing package refuses to report a Sauter mean diameter without a
+hardware calibration. That refusal is inherited here. If no calibration exists, the
+policy silently degrading to a fabricated size would be worse than useless, so instead it
+falls back to the orifice-radius approach and emits a warning stating that
+atomization-quality results must not be reported from it.}
+
+\subsection{Representing a range of sizes}
+
+A real spray is not one size. The largest droplets survive far longer than the mean and
+are the ones that actually reach the flame, so representing only the mean understates how
+much liquid arrives unevaporated. The Rosin-Rammler distribution describes the mass
+fraction contained in droplets smaller than $D$ as
+
+\begin{equation}
+  Q(D)=1-\exp\!\left[-\left(\frac{D}{X}\right)^{n}\right],
+  \label{eq:rosin-rammler}
+\end{equation}
+
+where $X$ is a characteristic diameter and $n$ measures how narrow the spray is. Its
+Sauter mean diameter is
+
+\begin{equation}
+  D_{32}=\frac{X}{\Gamma\!\left(1-\tfrac{1}{n}\right)},
+  \label{eq:rr-smd}
+\end{equation}
+
+which is inverted so that the classes reproduce the Sauter mean diameter requested.
+Equation~\eqref{eq:rr-smd} diverges as $n\to1$, so a lower bound on $n$ is enforced
+rather than allowing a distribution with no finite Sauter mean.
+
+\section{Droplet Breakup}
+
+A droplet moving quickly through gas is deformed by the pressure difference across it and
+pulled back into shape by surface tension. The Taylor analogy treats that competition as a
+mass on a spring with friction. Writing $y$ for the distortion scaled so that $y=1$ means
+the deformation has reached the droplet radius,
+
+\begin{equation}
+  \frac{d^{2}y}{dt^{2}}
+  =\frac{C_f}{C_b}\frac{\rho_g u_d^{2}}{\rho_{\ell}r_0^{2}}
+  -\frac{C_k\sigma}{\rho_{\ell}r_0^{3}}y
+  -\frac{C_d\mu_{\ell}}{\rho_{\ell}r_0^{2}}\frac{dy}{dt},
+  \label{eq:tab}
+\end{equation}
+
+with $C_k=8$, $C_f=1/3$, $C_d=5$, $C_b=1/2$. The three terms are, in order, the
+aerodynamic forcing, the surface-tension restoring force, and viscous damping. The
+balance between forcing and surface tension is the Weber number,
+
+\begin{equation}
+  \mathrm{We}_g=\frac{\rho_g u_d^{2} r_0}{\sigma},
+  \label{eq:weber}
+\end{equation}
+
+and the droplet breaks when the distortion reaches unity. Under steady forcing the
+distortion oscillates about an equilibrium value $\mathrm{We}_c=\mathrm{We}_g/12$ with
+amplitude $A$, so breakup is possible when $\mathrm{We}_c+A>1$.
+
+\warningbox{John et al. print this criterion as $A+\mathrm{We}_g>1$. That cannot be what
+they computed: for their own Fig.~3 case $\mathrm{We}_g\approx38$, so the criterion would
+fire immediately and no breakup time would be resolvable, yet their figure shows a finite
+$2\times10^{-5}$~s. The standard form $\mathrm{We}_c+A>1$ is used here and reproduces a
+breakup time of the right order.}
+
+The child radius follows from an energy balance between the parent's distortion energy
+and the new surface created,
+
+\begin{equation}
+  r=\frac{r_0}{1+\tfrac{8K}{20}y^{2}
+  +\dfrac{\rho_{\ell}r_0^{3}\dot y^{2}}{\sigma}\dfrac{6K-5}{120}},
+  \qquad K=\tfrac{10}{3}.
+  \label{eq:child-radius}
+\end{equation}
+
+One pass rarely reaches a stable size, so each child becomes the new parent and the test
+repeats until the Weber number is too small to sustain further breakup.
+
+\warningbox{The Taylor analogy describes a droplet torn apart from outside by aerodynamic
+forces. A flashing LNG droplet is burst from within by vapor generation, which is a
+different mechanism entirely. Breakup is therefore not applied in the flashing regimes;
+the size comes from the Tier 3 flash-spray result instead, and the decision is recorded
+as a warning rather than left implicit.}
+
+\section{Droplet Evaporation}
+
+Evaporation can be limited by either of two different things, and which one applies
+decides the equations.
+
+\subsection{Diffusion limited}
+
+Below the boiling point, fuel vapor must diffuse away from the surface before more can
+leave. The surface vapor mass fraction follows from the vapor pressure,
+
+\begin{equation}
+  Y_s=\frac{W_F}{W_F+W_{\mathrm{mix}}\left(\dfrac{p_g}{p_v(T_d)}-1\right)},
+  \label{eq:surface-fraction}
+\end{equation}
+
+and the difference between surface and far-field concentration drives the transfer,
+
+\begin{equation}
+  B_d=\frac{Y_s-Y_\infty}{1-Y_s},
+  \qquad
+  \mathrm{Sh}=\left(2+0.6\,\mathrm{Re}_d^{1/2}\mathrm{Sc}^{1/3}\right)
+  \frac{\ln(1+B_d)}{B_d},
+  \label{eq:spalding}
+\end{equation}
+
+\begin{equation}
+  \frac{dr}{dt}=-\frac{\rho_g D}{2\rho_{\ell}r}B_d\,\mathrm{Sh}.
+  \label{eq:evaporation}
+\end{equation}
+
+In still gas this reduces to $d(r^{2})/dt=\mathrm{constant}$, the classical
+\emph{$D^2$ law}: the square of the diameter falls linearly with time. Any evaporation
+model must reproduce it, and this one is verified to do so --- but only after the droplet
+has finished warming up, since the film temperature moves during that transient.
+
+\subsection{Boiling limited}
+
+Equation~\eqref{eq:surface-fraction} gives $Y_s=1$ when the vapor pressure reaches the
+ambient pressure, at which point $B_d$ becomes infinite and the diffusion description
+fails. That is the boiling point, and it is exactly where the second branch takes over.
+
+A boiling droplet cannot get any hotter: its temperature is pinned at saturation and
+every joule that arrives goes into the phase change,
+
+\begin{equation}
+  \frac{dm_d}{dt}=-\frac{\dot Q_{\mathrm{conv}}}{L_{\mathrm{vap}}}.
+  \label{eq:boiling}
+\end{equation}
+
+\warningbox{This branch is the single most important addition to the reference model.
+Flashing LNG arrives above its saturation temperature, so it is \emph{never} diffusion
+limited. Applying Equation~\eqref{eq:evaporation} to it would be wrong at the first step.}
+
+\section{Droplet Heating and Energy Accounting}
+
+Heat reaches the droplet by convection,
+
+\begin{equation}
+  \dot Q_{\mathrm{conv}}
+  =\frac{A_d\,\beta_{\mathrm{spray}}\,\mathrm{Nu}_d\,k(T_g-T_d)}{2r},
+  \qquad
+  \mathrm{Nu}_d=\left(2+0.6\,\mathrm{Re}_d^{1/2}\mathrm{Pr}_d^{1/3}\right)
+  \frac{\ln(1+B)}{B},
+  \label{eq:convective-heat}
+\end{equation}
+
+with gas properties evaluated at the film temperature
+$\bar T=(T_g+2T_d)/3$, weighted toward the droplet because most of the resistance sits in
+the thin layer against the surface.
+
+Part of that heat drives the phase change and the rest warms the liquid:
+
+\begin{equation}
+  c_{\ell}m_d\frac{dT_d}{dt}
+  =\dot Q_{\mathrm{conv}}+\frac{dm_d}{dt}L_{\mathrm{vap}}.
+  \label{eq:droplet-heating}
+\end{equation}
+
+Since $dm_d/dt$ is negative, the second term subtracts, as it must.
+
+\subsection{The bookkeeping that is easy to get wrong}
+
+Three statements must hold together, and stating them separately is what keeps the energy
+balance honest:
+
+\begin{enumerate}[label=(\roman*)]
+  \item the gas \emph{loses} $\dot Q_{\mathrm{conv}}$;
+  \item the droplet \emph{gains} $\dot Q_{\mathrm{conv}}$, spends
+        $|dm_d/dt|L_{\mathrm{vap}}$ on vaporization, and warms with the remainder;
+  \item the vapor enters the gas carrying the enthalpy it has \emph{at the droplet
+        temperature} $T_d$, not at the gas temperature.
+\end{enumerate}
+
+If item (iii) is neglected and the vapor is added at gas temperature, the latent heat is
+counted twice and the reactor runs hot. Equation~\eqref{eq:droplet-heating} is verified
+directly: the convective heat equals the sum of the latent and sensible terms to ten
+significant figures.
+
+\section{Reactor Types and the Cantera Implementation}
+
+A \emph{reactor} here is a region of the combustor treated as internally uniform. Which
+idealization it is given states what is being assumed about mixing inside it. A
+\emph{perfectly stirred reactor} assumes anything entering is instantly spread
+throughout, which suits recirculation and flame zones where turbulence is violent. A
+\emph{plug flow reactor} assumes the flow marches along without mixing backwards, which
+suits the post-flame length where axial velocity dominates. An \emph{evaporator} and a
+\emph{mixer} are stirred reactors that additionally contain droplets.
+
+Plug flow is represented as a chain of stirred reactors rather than by Cantera's
+\code{FlowReactor}, so that it participates in the same simultaneous network solution as
+everything else. The number of links is a numerical parameter whose convergence must be
+demonstrated, not assumed.
+
+The residence time of a zone is
+
+\begin{equation}
+  \tau_i=\frac{\bar\rho_i V_i}{\dot m_i}.
+  \label{eq:residence-time}
+\end{equation}
+
+\warningbox{Because a reactor stands for a coarse region with real internal variation,
+Equation~\eqref{eq:residence-time} gives an \emph{effective zone-scale} residence time.
+It is not the transit time of any particular parcel of fluid, and should not be read as
+one.}
+
+\section{Network Assembly, Mass Balance, and Steady Solution}
+
+\subsection{The splits will not balance, and what to do about it}
+
+Flow splits supplied by a user, or extracted from a computational fluid dynamics
+solution, will not conserve mass exactly. John et al. report imbalances up to 9.3\% on a
+single reactor. For each zone, what enters must equal what leaves:
+
+\begin{equation}
+  \dot m_{i,\mathrm{in}}+\sum_j \dot m_{ji}
+  =\dot m_{i,\mathrm{out}}+\sum_j \dot m_{ij}.
+  \label{eq:reactor-mass-balance}
+\end{equation}
+
+Collecting the reactor-to-reactor flows into a vector $\mathbf z$, that is a linear
+system $\mathbf{Az}=\mathbf b$, which the supplied flows miss by a residual
+$\mathbf r=\mathbf b-\mathbf{Az}$. We want the \emph{smallest} change $\Delta\mathbf z$
+that repairs it:
+
+\begin{equation}
+  \Delta\mathbf z^{*}=\arg\min\|\Delta\mathbf z\|_2^{2}
+  \quad\text{subject to}\quad \mathbf A\,\Delta\mathbf z=\mathbf r.
+  \label{eq:min-norm-correction}
+\end{equation}
+
+There are normally more flows than reactors, so the system is underdetermined and
+Equation~\eqref{eq:min-norm-correction} is exactly what a least-squares solve returns.
+Choosing the smallest change rather than rescaling means no single flow absorbs the
+entire error, and flows that were already consistent are barely touched.
+
+The rows of $\mathbf A$ sum to zero, since every internal flow leaves one reactor and
+enters another. A solution therefore exists only if the external streams balance
+globally. When they do not, the boundary conditions themselves are wrong and no
+redistribution can help, so the code raises rather than returning a plausible-looking
+repair.
+
+\subsection{Solving the network}
+
+Recirculation is what makes this a graph rather than a chain: hot products flowing back
+toward the injector are what hold the flame, so a zone's inlet can depend on its own
+downstream. All zones are therefore handed to a single Cantera \code{ReactorNet} and
+solved together, which handles the recycle without any iteration on our part.
+
+The steady state is reached by \emph{marching in time} until nothing moves any more,
+rather than by calling Cantera's steady-state solver.
+
+\warningbox{This reverses the original plan, for a measured reason. On a four-reactor,
+71-species recirculating network, \code{advance_to_steady_state} ran for 210~s and then
+failed. The same case marches to a converged answer, with an identical peak temperature
+of 1881~K, in 0.86~s. Marching is also bounded and observable: it integrates in chunks of
+two residence times, stops when every reactor temperature moves less than 0.05~K, and
+gives up after two hundred residence times with a warning. The cost is that element
+conservation closes to about $10^{-7}$ rather than $10^{-11}$, reflecting that tolerance.}
+
+\subsection{Detecting a solution that is not a combustor}
+
+A network initialized cold converges to a perfectly valid steady state in which nothing
+is burning. It solves the equations and it is useless. Reactors are therefore started hot
+and equilibrated, and any converged state whose peak temperature is within 50~K of the
+inlet air is reported as extinguished, because emissions computed from it are
+meaningless.
+
+\section{Coupling the Droplets to the Network}
+
+Evaporation depends on gas temperature, and gas temperature depends on evaporation.
+Solving both at once would place a stiff droplet system inside a stiff chemistry system.
+Instead the two are alternated: the droplets are marched with the gas held fixed, the
+network is solved with the resulting sources held fixed, and the process repeats with
+only part of each update applied.
+
+The partial step matters. Evaporation and temperature reinforce each other, since hotter
+gas evaporates more fuel, which burns and makes the gas hotter still, so taking the full
+step invites oscillation between a flooded and a starved state.
+
+Two details keep this honest. The vapor enters each zone at the \emph{droplet}
+temperature, and the heat the droplets absorbed is removed from the gas; without the
+second, injecting vapor would hand the gas back the latent heat it had just spent. And
+the network is rebuilt rather than edited on each pass, because evaporating fuel changes
+the total gas mass flow and therefore the mass balance itself.
+
+Droplets surviving the whole spray path are reported as \emph{liquid carryover}. This is
+a design failure rather than a rounding detail: fuel that never evaporates never burns.
+
+\section{Combustor Architecture Templates}
+
+The architectures differ in one decision, how much air meets the fuel before it burns,
+and that decision is what the dual-fuel study exists to make.
+
+\subsection{Rich-quench-lean}
+
+Burn the fuel rich, where it is too fuel-heavy to get very hot, then add air fast enough
+to cross stoichiometric quickly and finish lean.
+
+\warningbox{The quench is modeled as a chain of stages, not a single mixing point. This
+is not cosmetic. Nitric oxide is produced \emph{while} the mixture crosses stoichiometric
+on its way from rich to lean, and a single perfectly mixed point would jump straight over
+that crossing and hide the dominant source entirely.}
+
+Quench air is distributed along the stages by a declared schedule. Front-loading shortens
+the traverse but risks quenching the reaction; rear-loading does the opposite. The
+sensitivity to stage count and schedule is a required output, not an option.
+
+\subsection{Lean premixed and lean direct injection}
+
+Lean premixed mixes fuel and air completely before burning, so no part of the flame is
+hot enough to make much nitric oxide. Lean direct injection sprays into a lean dome with
+no premixing passage at all.
+
+\warningbox{Chemistry is \emph{not} frozen in the premixer, even though the whole idea of
+a premixer is that nothing reacts inside it. Freezing it would guarantee the assumption
+instead of testing it. Left reacting, the premixer ignites in the model precisely when
+residence time exceeds ignition delay, which is the real failure mode of the
+architecture. Lean direct injection has no premixing passage and therefore nowhere for
+this to happen, which is exactly why it is the natural comparison for Jet-A at landing
+and take-off.}
+
+\subsection{The idle passage as a design lever}
+
+Because the two fuel circuits are separate hardware, air flows through \emph{both}
+injector passages at all times, including the one whose fuel is shut off. If the Jet-A
+passage carries a share $a_J$ of the dome air and the LNG passage $a_L$, the air setting
+the equivalence ratio near the flame is
+
+\begin{equation}
+  f_{\mathrm{near}}=a_{\mathrm{active}}+\chi\,a_{\mathrm{idle}},
+  \label{eq:near-field-template}
+\end{equation}
+
+where $\chi$ is the fraction of idle-passage air reaching the near field. Every template
+routes this explicitly. Making $a_J$ small and $a_L$ large gives a rich Jet-A near field
+and a lean LNG near field with no moving parts.
+
+\warningbox{At $\chi=0$ the lever is at full strength; at $\chi=1$ it disappears
+entirely. A reactor network cannot determine $\chi$, so every result depending on it is
+reported across its full range rather than at one assumed value.}
+
+\subsection{Merging mechanisms}
+
+Combining a fuel mechanism with a nitrogen submodel is sometimes necessary, and the tool
+checks such a combination without performing it, because the choice changes the answer
+and belongs to whoever is accountable for it. Checked against the two mechanisms actually
+in use, it finds six species with inconsistent thermodynamic data, 223 duplicate
+reactions, and a species spelled \code{CH2*} in one file and \code{CH2(S)} in the other.
+The last is an error rather than a warning: a merged mechanism would carry two separate
+pools of what is physically one species.
+
+\section{Autoignition and Flashback Screening}
+
+A premixing passage exists so that fuel and air are uniform before they burn. It works
+only if the mixture takes longer to ignite on its own than it takes to cross the passage.
+The margin is a ratio of two times,
+
+\begin{equation}
+  M=\frac{\tau_{\mathrm{ign}}}{\tau_{\mathrm{res}}},
+  \label{eq:autoignition-margin}
+\end{equation}
+
+and a design guidance floor of $M\geq4$ is used as an editable input rather than a hidden
+constant. When $M<1$ the mixture ignites inside the injector, and the result is reported
+as an error rather than a number.
+
+\subsection{Why cold fuel buys margin}
+
+Fuel that has flashed arrives cold, and whatever is still liquid draws its latent heat out
+of the air. Both effects lower the premixed temperature, and because ignition delay
+depends on temperature exponentially, a modest cooling buys a large increase in margin.
+Measured here with air at 800~K and 20~atm:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Case & $T_{\mathrm{mix}}$ & Drop & of which latent \\
+\midrule
+Jet-A vapour at 470~K & 774.1~K & 25.9~K & 0.0~K \\
+Jet-A, 30\% liquid & 771.5~K & 28.5~K & 2.6~K \\
+LNG vapour at 150~K & 747.2~K & 52.8~K & 0.0~K \\
+LNG, 30\% liquid & 742.8~K & 57.2~K & 4.4~K \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LNG cools the mixture about twice as much as Jet-A. Note that the latent contribution is
+only about 4~K of a 57~K drop: the benefit is overwhelmingly the sensible enthalpy of cold
+vapour, not the phase change. It would be easy, and wrong, to assume the opposite.
+
+\subsection{What that is worth}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Fuel & $T_{\mathrm{mix}}$ & $\tau_{\mathrm{ign}}$ & $M$ at 1~ms & $M$ at 3~ms \\
+\midrule
+Jet-A & 774~K & 4.04~ms & 4.0 (safe) & 1.3 (marginal) \\
+LNG & 747~K & no ignition in 10~s & unbounded & unbounded \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Jet-A tolerates roughly one millisecond of premixing at landing and take-off conditions.
+LNG is effectively inert on premixer timescales. This is the quantitative basis for
+considering a lean premixed LNG cruise alongside a lean direct injection or
+rich-quench-lean Jet-A landing and take-off.
+
+\warningbox{The flashback screen is \emph{suppressed} unless a laminar flame speed is
+supplied. Obtaining one requires a flame calculation this tool does not perform, and
+inventing a value would place an unmarked guess underneath a safety screen. The screen
+reports nothing rather than something unfounded.}
+
+\section{Cryogenic Thermal Fuel Management}
+
+LNG leaves the tank near 110~K and must reach the injector warm enough to flash usefully.
+Fuel temperature is therefore a design variable, pulled in four directions at once:
+enough superheat at the nozzle for the intended flash regime; enough subcooling upstream
+that the feed line does not boil; enough autoignition margin; and within the heat actually
+available to dump into the fuel.
+
+\subsection{The window, and what sets its width}
+
+Superheat at the injector and subcooling in the line compete for the same resource: the
+temperature gap between saturation at feed pressure and saturation at chamber pressure.
+With a 20~bar chamber:
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Feed pressure & Saturation gap & Feasible $T_{\mathrm{fuel}}$ & Width \\
+\midrule
+2.5~MPa & 6.1~K & \textbf{none} & --- \\
+3.0~MPa & 11.4~K & 171.0--172.0~K & 1.0~K \\
+4.0~MPa & 20.2~K & 171.0--181.0~K & 10.0~K \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\warningbox{Below roughly 3~MPa feed pressure there is \emph{no} feasible fuel temperature
+at all. No amount of heating fixes this, because the gap itself is too narrow. Pump
+pressure is what buys thermal design freedom, which connects this window directly to the
+pressure budget the package already computes.}
+
+Above the critical pressure of the mixture there is no saturation at all. Supercritical
+injection is a legitimate design choice, but the subcooling and superheat constraints are
+defined only below the critical point and do not apply to it; the code says so explicitly
+rather than failing obscurely.
+
+\subsection{The circuit that is not running}
+
+A dual-fuel nozzle always has one circuit hot and stagnant. With no flow there is no
+convective cooling, so the idle fuel sits near wall temperature. Jet-A left in a hot
+passage forms deposits that block the injector; LNG left in one boils, and restart then
+delivers vapour rather than liquid. Either can veto an otherwise attractive packaging, and
+it is cheaper to discover here than on a test stand.
+
+\section{Verification Coverage}
+
+Verification asks whether the software solves the equations it claims to. It is kept
+separate from validation, which asks whether those equations describe reality.
+
+\subsection{Limits and identities}
+
+The residence-time definition reproduces the identity the reference paper states.
+A stirred reactor given a long residence time approaches the equilibrium state. Shrinking
+it below a critical size extinguishes it. With no fuel, air passes through unchanged.
+Droplet evaporation recovers the $D^2$ law once the warm-up transient is excluded, and the
+boiling branch reproduces $\dot m=\dot Q/L$ exactly. The droplet energy split closes to ten
+significant figures. Element balances close to about $10^{-7}$.
+
+\subsection{Convergence}
+
+A plug flow zone represented as a chain of stirred reactors converges with the number of
+links. The droplet integration is insensitive to solver tolerance across four orders of
+magnitude. The ignition-delay table changes by under 15\% when its temperature grid is
+refined fourfold.
+
+\subsection{Comparison with the reference paper}
+
+The purpose is directional: to confirm the implementation reproduces the paper's trends
+and conclusions, not its absolute numbers. Two of its quantitative anchors are only
+partly reproducible, and this is stated rather than smoothed over.
+
+\emph{Breakup and evaporation timescales.} Breakup agrees to an order of magnitude, at
+$3.4\times10^{-5}$~s against their $2\times10^{-5}$~s. Evaporation does not: we obtain
+0.80~s against their reported 6~ms at 350~K. Their case is underspecified, giving neither
+ambient pressure nor liquid properties, and 6~ms is difficult to reconcile with realistic
+kerosene volatility. What is reproduced is their \emph{conclusion}: breakup is faster than
+evaporation by more than two orders of magnitude at 350~K, the separation narrows with
+temperature, and it still exceeds one order of magnitude at 900~K. That conclusion is what
+justifies treating the two sequentially, which is what the implementation depends on.
+
+\emph{Liquid against gaseous networks.} This is reproduced cleanly. The same topology and
+flows, run once with droplets and once with the fuel gaseous and perfectly mixed:
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & $\phi$ range & Peak $T$ & Exit $T$ & NO \\
+\midrule
+With spray & 0.514--1.714 & 2453~K & 1926.6~K & 1868~ppm \\
+Gaseous, premixed & 0.514--0.514 & 1928~K & 1928.0~K & 57~ppm \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Exit temperature differs by 0.07\%. Nitric oxide differs by a factor of 33. That asymmetry
+is the paper's entire argument: both methods get the global energy balance right, and only
+one gets the emissions right, because nitric oxide responds exponentially to the hot
+pockets that spray heterogeneity creates. Their reported contrast, a gaseous network
+underpredicting by 54--91\% with peak temperatures near 1800~K against above 2200~K with
+spray, matches this in both direction and character.
+
+\warningbox{Achieving this required the gaseous comparison to be genuinely premixed, with
+fuel distributed to every zone in proportion to its air. Injecting the vapour only at the
+dome retains the air-staging heterogeneity and is not the paper's comparison; the two cases
+then differ by a few percent instead of a factor of thirty.}
+
+\subsection{What is not claimed}
+
+Absolute nitric oxide is not claimed to match the paper. Their reactor volumes,
+connectivity, spray path lengths, and propagation fractions are unpublished, so their
+calibrated network cannot be rebuilt. Their chemistry also differs: they used a mechanism
+whose oxidation base carries no nitrogen chemistry, and the paper does not state which
+nitrogen submodel they appended.
+
+Absolute emission levels from this implementation are also not validated, and the reason
+is now understood rather than merely suspected.
+
+\subsection{How fast the quench is decides the answer}
+
+The rich-quench-lean optimum initially fell at $\phi_{\mathrm{rich}}=1.22$, richer than
+classical practice indicates, on a curve so flat it barely had a minimum. A sensitivity
+study established that the cause was an unrealistically long quench, not the reactor model.
+
+Discretization first. Splitting the quench into stages matters, and the size of the effect
+is worth stating plainly: a \emph{single} perfectly mixed quench point underpredicts
+nitric oxide by more than half, because it jumps straight over the stoichiometric crossing
+where most of it is made. The result converges to about 1\% by twelve stages.
+
+Quench \emph{speed} matters more:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Quench residence time & Optimum & Minimum $\mathrm{EI}_{\mathrm{NOx}}$ \\
+\midrule
+$\sim$0.9~ms (realistic) & $\phi_{\mathrm{rich}}=1.35$, sharp & 68.5 \\
+$\sim$4.6~ms & $\phi_{\mathrm{rich}}=1.22$, flat & 130.6 \\
+$\sim$18~ms & no interior minimum & 176.9 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Real quench jets penetrate and mix in roughly half a millisecond to a millisecond, and
+that speed is the entire point of the architecture. At a realistic quench the optimum
+lands at 1.35 with a pronounced minimum, meeting the sanity anchor. A slow quench dwells
+near stoichiometric, inflates nitric oxide, and progressively destroys the very optimum
+the architecture exists to exploit.
+
+\warningbox{The optimum itself exists only when there is enough quench \emph{air}, not
+merely enough quench speed. Measured at four quench-air fractions, an interior optimum is
+present at 0.30 and 0.38 of the total air but absent at 0.15 and 0.20, where the curve
+inverts and $\phi_{\mathrm{rich}}\approx1.4$ becomes the worst choice rather than the
+best. Rich-quench-lean depends on crossing stoichiometric quickly, and the crossing needs
+both time and air. Any statement about a rich-zone optimum must name the quench-air
+fraction it assumes.}
+
+\warningbox{Absolute emission indices remain roughly twice what real rich-quench-lean
+hardware achieves. The zones here are adiabatic, and a perfectly stirred quench still
+mixes more slowly than real jets even at one millisecond. The optimum's \emph{location}
+and the \emph{trends} are supported; the absolute \emph{level} is not.}
+
+\section{Known Deviations and Technical Debt}
+
+The numbered deviations table lives in \code{docs/CRN_IMPLEMENTATION_LOG.md} and is the
+authoritative record. The ones that change how a result should be read are:
+
+\begin{itemize}
+  \item Jet-A uses two mechanisms, one for the network and one for ignition delay,
+        because a high-temperature-only mechanism overpredicts ignition delay by 510$\times$
+        at 700~K and would declare an unsafe premixer safe.
+  \item The premixer is modelled as reacting rather than chemically frozen, so that its
+        real failure mode is visible in the solution.
+  \item The breakup criterion follows the standard Taylor analogy rather than the form
+        printed in the paper, which cannot be what they computed.
+  \item Steady state is reached by marching in time rather than by Cantera's steady
+        solver, which failed on a recirculating network. Element conservation closes to
+        about $10^{-7}$ rather than $10^{-11}$ as a result.
+  \item The flashback screen and all droplet-size outputs are suppressed rather than
+        estimated when the inputs they need are absent.
+\end{itemize}
+
+\appendix
+
+\section{Cantera Interface Used by This Work}
+
+Pinned to \textbf{Cantera 3.2.0}. Verified present in the installed version rather than
+taken from documentation, because the reactor and flow-device interface changed between
+Cantera 2.6 and 3.x.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Purpose & Cantera name & Note \\
+\midrule
+Gas mixture and kinetics & \code{Solution} & One per reactor; never shared \\
+Fixed boundary condition & \code{Reservoir} & Air inlets, fuel vapor, exhaust \\
+Perfectly stirred reactor & \code{IdealGasConstPressureMoleReactor} & Mole-based; see below \\
+Alternative reactor forms & \code{IdealGasReactor}, \code{IdealGasMoleReactor} & \\
+Custom governing equations & \code{ExtensibleIdealGasConstPressureReactor} & For coupled droplets \\
+Steady plug flow & \code{FlowReactor} & Not \code{PlugFlowReactor}; see below \\
+Prescribed stream & \code{MassFlowController} & Reactor-to-reactor flows \\
+Pressure closure & \code{PressureController} & Network exit \\
+Pressure-driven flow & \code{Valve} & \\
+Heat transfer & \code{Wall} & Liner heat loss \\
+Surface chemistry & \code{ReactorSurface} & Not currently used \\
+Network assembly and solution & \code{ReactorNet} & \\
+Steady solution & \code{ReactorNet.advance_to_steady_state} & \\
+Time integration & \code{ReactorNet.advance}, \code{.step} & \\
+Large-mechanism speedup & \code{AdaptivePreconditioner} & Mole reactors only \\
+Stoichiometry & \code{Solution.stoich_air_fuel_ratio} & \\
+Equivalence ratio & \code{Solution.equivalence_ratio} & Element-based \\
+Mixture fraction & \code{Solution.mixture_fraction} & Bilger \\
+Profile storage & \code{SolutionArray} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two findings from that verification are worth recording.
+
+\emph{Mole-based reactors are not a stylistic preference.} Sparse Jacobian
+preconditioning, which is what makes a network of 70-species reactors solve in seconds
+rather than minutes, is supported only for \code{IdealGasMoleReactor} and
+\code{IdealGasConstPressureMoleReactor}. That determines the default reactor type.
+
+\emph{There is no \code{PlugFlowReactor} class.} The Cantera documentation describes a
+``Plug Flow Reactor'', but the class is named \code{FlowReactor}. A plug flow zone is
+represented here by a series of stirred reactors instead, which participates in the
+simultaneous network solution; \code{FlowReactor} is reserved as an independent
+cross-check.
+
+\section{Building This Report}
+
+From the repository root:
+
+\begin{verbatim}
+pixi run doc-crn
+\end{verbatim}
+
+which runs Tectonic on this file. \code{pixi run doc} builds both this report and the
+nozzle technical reference.
+
+\end{document}

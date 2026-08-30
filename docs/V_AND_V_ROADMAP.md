@@ -447,6 +447,51 @@ The first useful transcription batch is:
 This sequence enables quantitative choking validation, immediate pressure-swirl regression tests,
 and a direct Jet-A spray check without mixing calibration and validation evidence.
 
+## 9A. Reactor-Network Extension (added 2026-08-28)
+
+The `fuelnozzle.crn` subpackage is documented in `docs/CRN_PLAN.md` (intent) and
+`docs/CRN_IMPLEMENTATION_LOG.md` (build record, numbered deviations, open items).
+
+**Defensible claim.** The extension is verified against limits, identities, and
+convergence, and it reproduces the trend and conclusion of John et al. (2026) for liquid
+against gaseous reactor networks. It is **not** validated against experiment. Absolute
+emissions are not predictions; relative comparison under stated assumptions is the
+intended use.
+
+**Verification achieved.** Residence-time identity; equilibrium and extinction limits;
+zero-fuel limit; D2-law and analytic boiling rate; droplet energy closure to 1e-10;
+element balance to about 1e-7; minimum-norm mass correction verified against a hand-solved
+minimum; plug-flow segment, droplet-tolerance, and ignition-table convergence.
+
+**Paper comparison.** Reproduced: exit temperature agreeing to 0.07% while NO differs by
+a factor of 33, matching the reported asymmetry. Not reproduced: their evaporation
+timescale, because their case gives neither ambient pressure nor liquid properties.
+
+**Open items.**
+
+- **O-005 is resolved (2026-08-29).** A quench sensitivity study showed the cause was an
+  unrealistically long quench residence time, not the reactor model. A single mixing point
+  underpredicts NOx by more than half; twelve stages converge to about 1%; and quench time
+  from 0.9 to 18 ms takes EI_NOx from 69 to 199 while flattening and finally destroying
+  the optimum. At a realistic ~1 ms quench the optimum is `phi_rich` = 1.35 with a sharp
+  minimum, meeting the sanity anchor. Defaults corrected and guarded. **Residual stated
+  limitation:** absolute EI_NOx remains about twice real hardware, attributable to
+  adiabatic zones and stirred-reactor quench mixing, so the optimum's location and trends
+  are supported but the level is not.
+- **The O-005 result is conditional on quench air fraction (2026-08-29).** A follow-up
+  sweep showed the rich-quench-lean NOx optimum exists only when quench air is roughly
+  0.30 or more of the total. At 0.20 the curve inverts and `phi_rich` near 1.4 becomes the
+  worst case rather than the best. Quench *quantity* is a second decisive driver alongside
+  quench *time*. Any RQL conclusion must state the quench-air fraction it assumes.
+- **O-002**: no LNG spray calibration exists, so LNG droplet-size outputs remain gated.
+  One flashing flow test would also pin the Tier 2 relaxation time and convert the `L/D`
+  geometric target from a trend into a number.
+
+**Priority evidence request for the extension.** A single flashing LNG flow test
+(geometry, inlet state, back pressure, mass flow, uncertainty) is the highest-value
+experiment: it pins the relaxation time, unlocks the `L/D` target, and is cheap relative
+to a rig campaign.
+
 ## 10. Documentation and Reproducibility Deliverables
 
 Planned repository additions during V&V implementation:

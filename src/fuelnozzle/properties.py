@@ -57,6 +57,22 @@ class CoolPropLNGProvider:
     def fluid_label(self) -> str:
         return "&".join(self.composition.components)
 
+    @property
+    def molar_mass_kg_mol(self) -> float:
+        """Mole-fraction-weighted molar mass of the LNG mixture.
+
+        Needed by the reactor-network droplet models to convert between the mole basis
+        CoolProp reports and the mass basis the evaporation equations use.
+        """
+        return float(
+            sum(
+                fraction * molar_mass
+                for fraction, molar_mass in zip(
+                    self.composition.fractions, self._component_molar_masses, strict=True
+                )
+            )
+        )
+
     def state_pt(self, pressure_pa: float, temperature_k: float) -> ThermodynamicState:
         self._validate_pressure(pressure_pa)
         if not isfinite(temperature_k) or temperature_k <= 0.0:

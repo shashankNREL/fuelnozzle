@@ -166,6 +166,33 @@ for a cavitation screen when Jet-A vapor pressure is supplied.
 The solver reports Reynolds, Weber, and Ohnesorge numbers. As for LNG, the
 Jet-A SMD field remains empty unless a hardware-specific coefficient is supplied.
 
+## Combustor Reactor Network
+
+The `fuelnozzle.crn` subpackage carries the nozzle result into the combustor. Full
+equations are in `docs/crn_technical_reference.tex`; the design record is in
+`docs/CRN_PLAN.md`.
+
+Zones are stirred or plug-flow reactors solved simultaneously by Cantera, so
+recirculation needs no tearing. Supplied flow splits are repaired by the smallest
+correction that conserves mass everywhere,
+
+$$
+\Delta\mathbf z^*=\arg\min\|\Delta\mathbf z\|_2^2
+\quad\text{s.t.}\quad \mathbf A\,\Delta\mathbf z=\mathbf r,
+$$
+
+rather than by rescaling, so flows that were already consistent are barely touched.
+
+Droplets are handled by operator splitting: they are marched with the gas frozen, the
+network is solved with the resulting sources frozen, and the two alternate under
+relaxation. Evaporation follows a diffusion-limited branch below the boiling point and a
+heat-transfer-limited branch above it; flashing LNG is always on the second, which is the
+main physics addition over the gaseous-fuel literature.
+
+Vapour enters each zone at the *droplet* temperature and the heat the droplets absorbed is
+removed from the gas. Without the second, injecting vapour would return the latent heat
+the gas had just spent.
+
 ## Validation Priorities
 
 1. CoolProp states against NIST/REFPROP values for the selected LNG composition.
@@ -178,3 +205,13 @@ Jet-A SMD field remains empty unless a hardware-specific coefficient is supplied
 
 Every correlation or fitted parameter used for a design decision should retain
 its source, validity range, and uncertainty outside this numerical core.
+
+For the reactor-network extension, add:
+
+7. Reactor-network limits and convergence, which are covered by `tests/test_crn_verification.py`.
+8. The liquid-against-gaseous comparison, which reproduces the reference paper's
+   asymmetry: exit temperature agreeing to 0.07% while NO differs by a factor of 33.
+9. Rich-quench-lean optimum location and absolute NOx level, both currently **open**. The
+   optimum falls slightly richer than classical practice and absolute levels are several
+   times real hardware, consistent with a perfectly stirred quench dwelling near
+   stoichiometric. See open item O-005.
