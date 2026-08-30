@@ -155,6 +155,80 @@ design answers. The test
 equation and evidence status for every design-driving model is tracked in
 \code{docs/CRN_EQUATION_REGISTER.md}.
 
+\subsection{Stage 1: one mission description and one shared liner}
+
+Earlier CRN examples could repeat pressure, temperature, and flow values in a second
+\code{MissionPoint}. Two copies of the same fact can quietly disagree. The function
+\code{mission_point_from_operating} now converts the canonical \code{OperatingPoint} into a
+CRN point and retains both the original point and its named pressure stations; see
+\srcline{src/fuelnozzle/crn/mission.py}{15--42} and
+\srcline{src/fuelnozzle/crn/design.py}{273--290}. The
+\code{MissionProfile.from_icao_lto} check at
+\srcline{src/fuelnozzle/crn/mission.py}{52--77} requires one Jet-A point for each of the four
+ICAO modes---takeoff, climb-out, approach, and idle---and an explicit duration for every mode.
+\code{MissionProfile.from_cruise} at
+\srcline{src/fuelnozzle/crn/mission.py}{79--91} accepts one or more LNG cruise points.
+
+\code{resolve_pressure_stations} at
+\srcline{src/fuelnozzle/operating.py}{98--123} gives separate names to compressor discharge,
+dome, combustor exit, and fuel-nozzle inlet pressure. The liner loss is the user-given
+fraction of compressor-discharge pressure. The current first-order model takes dome pressure
+equal to compressor discharge and subtracts the liner loss to obtain combustor-exit pressure.
+It also checks that the active pump can reach chamber pressure plus the requested nozzle
+drop. These are transparent bookkeeping assumptions, not a prediction of the detailed
+pressure field.
+
+A full annular combustor contains repeated fuel-injector ``cups.'' The
+\code{SectorDefinition} conversions at
+\srcline{src/fuelnozzle/crn/hardware.py}{23--41} multiply engine-total air and fuel flows by
+the fraction of cups represented. Scaling both flows by the same number preserves their
+ratio. This assumes identical cups and no circumferential distortion.
+
+The new \code{SharedLinerGeometry} at
+\srcline{src/fuelnozzle/crn/hardware.py}{110--167} contains one set of zone volumes, air-hole
+effective areas, and a cooling-air destination used for both fuels.
+\code{DualFuelHardware} at
+\srcline{src/fuelnozzle/crn/hardware.py}{170--190} puts separate Jet-A and LNG passages inside
+that liner. Their fixed effective areas determine how the dome air divides; the optimizer
+cannot claim a different split without changing hardware. In
+\code{DesignEvaluator.\_build}, \srcline{src/fuelnozzle/crn/evaluate.py}{184--231}, supplied
+hardware replaces the legacy optimized air fractions and volumes. Prescribed fractions are
+still allowed for comparison with data, but \code{DualFuelHardware.\_\_post\_init\_\_}
+requires a calibration identifier so an unexplained number cannot masquerade as geometry.
+
+\subsubsection{How air flow through a hole is estimated}
+
+\code{AirAdmission.mass\_flow\_kg\_s} at
+\srcline{src/fuelnozzle/crn/hardware.py}{58--93} uses the standard compressible ideal-gas
+orifice equation. In plain language, more effective hole area or upstream pressure passes
+more air, while hotter air is less dense and passes less mass. When the downstream-to-upstream
+pressure ratio falls below the critical value, the throat reaches the speed of sound and
+further lowering downstream pressure no longer raises this idealized mass flow; this is
+called choking.
+
+The equation assumes steady, one-dimensional, isentropic air with constant
+$\gamma=1.4$ and $R=287.05$ J/(kg K). A discharge coefficient accounts approximately for
+contraction and losses. \code{SharedLinerGeometry.area\_derived\_split} at
+\srcline{src/fuelnozzle/crn/hardware.py}{136--167} evaluates all five admissions between the
+same prescribed upstream and downstream pressures and normalizes their flows to fractions.
+It does \emph{not} yet solve the pressure loss from the geometry, force the absolute sum to
+equal engine air flow, predict axial pressure variation, or describe jets penetrating a
+crossflow. Cold-flow or sector-rig data are therefore still required, and design acceptance
+remains unknown.
+
+\subsubsection{How a declared LNG mixture reaches chemistry}
+
+Property software calls methane ``Methane,'' whereas the chemical mechanism calls it
+\code{CH4}. \code{LNGComposition.cantera\_mole\_fractions} at
+\srcline{src/fuelnozzle/models.py}{69--85} performs the explicit name conversion for methane,
+ethane, propane, and nitrogen. \code{MechanismRegistry.with\_lng\_composition} at
+\srcline{src/fuelnozzle/crn/chemistry.py}{195--208} then copies those mole fractions into both
+LNG chemistry roles. \code{validate\_mechanism} at
+\srcline{src/fuelnozzle/crn/chemistry.py}{223--273} checks the mapped names against the loaded
+mechanism. An unsupported component stops with an error instead of being dropped, because
+dropping part of a fuel changes its heating value, stoichiometric air requirement, flame
+temperature, and emissions.
+
 \section{Kinetic Mechanisms}
 
 \subsection{What a mechanism is}

@@ -83,6 +83,47 @@ class PressureBudget:
     warnings: tuple[ModelWarning, ...]
 
 
+@dataclass(frozen=True)
+class ResolvedPressureStations:
+    """Pressures used by the compressor, liner, combustor, and fuel nozzles."""
+
+    compressor_discharge_pa: float
+    dome_pa: float
+    combustor_exit_pa: float
+    lng_nozzle_inlet_pa: float
+    jet_a_nozzle_inlet_pa: float
+    liner_pressure_loss_pa: float
+
+
+def resolve_pressure_stations(point: OperatingPoint) -> ResolvedPressureStations:
+    """Resolve one explicit pressure path without changing legacy nozzle semantics."""
+    loss_fraction = point.liner_pressure_loss_fraction or 0.0
+    liner_loss = point.p3_pa * loss_fraction
+    combustor_exit = point.p3_pa - liner_loss
+    if combustor_exit <= 0.0:
+        raise ValueError("Liner pressure loss leaves a non-positive combustor pressure")
+    active_pump = (
+        point.jet_a_pump_outlet_pressure_pa
+        if point.active_fuel == "jet_a"
+        else point.lng_pump_outlet_pressure_pa
+    )
+    active_nozzle_inlet = point.p3_pa + (
+        point.jet_a_nozzle_pressure_drop_pa
+        if point.active_fuel == "jet_a"
+        else point.lng_nozzle_pressure_drop_pa
+    )
+    if point.active_fuel is not None and active_pump < active_nozzle_inlet:
+        raise ValueError("Active-fuel pump pressure cannot supply the requested nozzle pressure")
+    return ResolvedPressureStations(
+        compressor_discharge_pa=point.p3_pa,
+        dome_pa=point.p3_pa,
+        combustor_exit_pa=combustor_exit,
+        lng_nozzle_inlet_pa=point.p3_pa + point.lng_nozzle_pressure_drop_pa,
+        jet_a_nozzle_inlet_pa=point.p3_pa + point.jet_a_nozzle_pressure_drop_pa,
+        liner_pressure_loss_pa=liner_loss,
+    )
+
+
 def fuel_pressure_budget(
     pump_outlet_pressure_pa: float,
     nozzle_pressure_drop_pa: float,

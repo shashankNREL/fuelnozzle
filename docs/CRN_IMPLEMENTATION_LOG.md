@@ -1430,7 +1430,7 @@ The user approved Stages 0--2 followed by the remaining stages. This section is 
 record of implementation details, verification, and deviations. Entries are appended as work
 is completed; a stage is not complete merely because code exists.
 
-### 10.1 Stage 0 -- fail-closed screening status (in progress)
+### 10.1 Stage 0 -- fail-closed screening status (complete)
 
 Implemented so far:
 
@@ -1455,3 +1455,62 @@ Deviations and constraints:
   acceptance mechanism itself is now implemented.
 - “Unknown” is not treated as physical failure. It is a distinct state that is ineligible
   for design acceptance until evidence resolves it.
+
+Verification at closure: 61 focused tests passed, Ruff passed, and the changed files passed
+secret scanning. Commit `4bdf83f` records the stage.
+
+### 10.2 Stage 1 -- canonical mission state and shared hardware (complete)
+
+Implemented:
+
+- `OperatingPoint` remains the canonical user input. `resolve_pressure_stations()` now names
+  compressor-discharge, dome, combustor-exit, and both fuel-nozzle inlet pressures, applies the
+  declared liner pressure-loss fraction, and rejects an active-fuel pump that cannot supply the
+  requested chamber pressure plus nozzle drop.
+- `mission_point_from_operating()` is the only adapter from canonical operating inputs into the
+  CRN `MissionPoint`. It retains the source point and resolved stations for traceability.
+  `MissionProfile.from_icao_lto()` requires exactly one Jet-A takeoff, climb-out, approach, and
+  idle point, including explicit durations; `from_cruise()` requires one or more LNG points.
+- `SectorDefinition` explicitly converts engine-total flow to the modeled cup sector and back.
+  The adapter applies that scale to both fuel and combustor air, preserving air/fuel ratio.
+- `DualFuelHardware` installs separate Jet-A and LNG passage geometries in one immutable
+  `SharedLinerGeometry`. The passage-air share is calculated from fixed effective areas instead
+  of remaining an independent optimizer choice. Zone volumes and cooling destination likewise
+  come from the shared liner when hardware is supplied.
+- `AirAdmission.mass_flow_kg_s()` implements the compressible ideal-gas orifice relation with
+  the subcritical and choked branches. `SharedLinerGeometry.area_derived_split()` normalizes
+  flows through the five fixed effective areas. Prescribed fractions remain available only as a
+  named calibration mode with a non-empty calibration identifier.
+- `DesignEvaluator` accepts `MissionProfile`, canonical `OperatingPoint` objects, or legacy
+  `MissionPoint` objects. Area-derived hardware replaces optimized station fractions; legacy
+  direct mission input remains supported but receives an `UNKNOWN` canonical-hardware gate.
+- `LNGComposition.cantera_mole_fractions()` maps CoolProp fluid names to mechanism species.
+  `MechanismRegistry.with_lng_composition()` propagates that declared composition into both
+  LNG mechanism roles. Unsupported components are rejected rather than silently discarded.
+- New regression tests cover pressure closure and pump deficit, sector scaling, effective-area
+  air splits, calibration traceability, passage shares, mission ordering/completeness, and LNG
+  composition propagation/rejection.
+
+Assumptions and limitations retained deliberately:
+
+- The air-hole equation assumes steady, one-dimensional, isentropic, calorically perfect air
+  with constant `gamma=1.4` and `R=287.05 J/(kg K)`. A discharge coefficient represents losses.
+  All stations presently use the same prescribed downstream pressure. The model does not
+  resolve liner axial pressure, swirl, crossflow jet penetration, or hole-to-hole interaction.
+- Air-hole flows are normalized into fractions. They do not yet enforce that the sum of
+  absolute hole flows equals the canonical combustor air flow, nor do they solve liner pressure
+  loss from geometry. Consequently this is a more physical parameterization, not a validated
+  pressure-loss model; acceptance remains `UNKNOWN`.
+- Sector scaling assumes nominally identical cups and that canonical flows are engine totals.
+  Distortion and circumferential maldistribution require external data.
+- Real liner effective areas, volumes, discharge coefficients, cycle-deck states, and
+  representative LNG compositions are unavailable. No values were invented.
+
+Deviations from the approved plan:
+
+- Stage 1 introduces the complete hardware and mission interfaces but cannot calibrate or
+  validate them without the external geometry and cycle deck assigned to later evidence gates.
+- Legacy `MissionPoint` and prescribed air fractions remain as compatibility and explicitly
+  traceable calibration paths. They are not accepted as canonical design evidence.
+
+Verification at closure: 67 focused Stage 1/chemistry/design tests passed and Ruff passed.

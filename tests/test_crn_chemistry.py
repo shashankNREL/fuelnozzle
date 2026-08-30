@@ -149,13 +149,37 @@ def test_gri30_warns_above_its_validity_pressure():
     assert "MECHANISM_PRESSURE_ABOVE_VALIDITY" in codes
 
 
-def test_unrepresented_lng_component_raises_rather_than_being_dropped():
+def test_represented_lng_components_map_between_property_and_mechanism_names():
     spec = lng_spec()
     solution = registry().template(spec.fuel, spec.role)
     composition = LNGComposition(mole_fractions={"Methane": 0.9, "Ethane": 0.1})
 
-    with pytest.raises(MechanismError, match="absent from mechanism"):
+    assert validate_mechanism(
+        spec, solution, require_nox=True, lng_composition=composition
+    )
+    assert composition.cantera_mole_fractions() == {"CH4": 0.9, "C2H6": 0.1}
+
+
+def test_unmapped_lng_component_raises_rather_than_being_dropped():
+    spec = lng_spec()
+    solution = registry().template(spec.fuel, spec.role)
+    composition = LNGComposition(mole_fractions={"Methane": 0.9, "n-Butane": 0.1})
+
+    with pytest.raises(MechanismError, match="No Cantera species mapping"):
         validate_mechanism(spec, solution, require_nox=True, lng_composition=composition)
+
+
+def test_registry_uses_declared_lng_composition_for_combustion():
+    composition = LNGComposition(
+        mole_fractions={"Methane": 0.85, "Ethane": 0.10, "Propane": 0.03, "Nitrogen": 0.02}
+    )
+    composed = registry().with_lng_composition(composition)
+    assert composed.spec_for(FuelKind.LNG, MechanismRole.NETWORK).fuel_mole_fractions == {
+        "CH4": 0.85,
+        "C2H6": 0.10,
+        "C3H8": 0.03,
+        "N2": 0.02,
+    }
 
 
 def test_missing_fuel_species_raises():

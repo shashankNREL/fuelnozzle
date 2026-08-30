@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from fuelnozzle.crn.chemistry import FuelKind
 from fuelnozzle.crn.streams import AirSplit
 from fuelnozzle.models import ModelWarning, WarningSeverity
+from fuelnozzle.operating import OperatingPoint, ResolvedPressureStations
 
 
 class VariableClass(StrEnum):
@@ -281,6 +282,8 @@ class MissionPoint:
     duration_s: float = 0.0
     thrust_fraction: float = 1.0
     nozzle_wall_temperature_k: float | None = None
+    operating_point: OperatingPoint | None = None
+    pressure_stations: ResolvedPressureStations | None = None
 
     def scaled(self, fuel_scale: float) -> MissionPoint:
         return replace(self, fuel_mass_flow_kg_s=self.fuel_mass_flow_kg_s * fuel_scale)

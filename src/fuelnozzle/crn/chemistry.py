@@ -192,6 +192,21 @@ class MechanismRegistry:
         except Exception as error:  # pragma: no cover - depends on user file
             raise MechanismError(f"Could not load mechanism {spec.path!r}: {error}") from error
 
+    def with_lng_composition(self, composition: LNGComposition) -> MechanismRegistry:
+        """Return a registry whose LNG fuel streams match the thermodynamic mixture."""
+        mapped = composition.cantera_mole_fractions()
+        specs = [
+            (
+                MechanismSpec.model_validate(
+                    {**spec.model_dump(), "fuel_mole_fractions": mapped}
+                )
+                if spec.fuel is FuelKind.LNG
+                else spec
+            )
+            for spec in self.specs
+        ]
+        return MechanismRegistry(specs)
+
 
 def nox_pathway_coverage(solution: ct.Solution) -> NOxPathwayCoverage:
     """Report which NO formation routes a mechanism carries."""
@@ -264,7 +279,11 @@ def validate_mechanism(
         )
 
     if lng_composition is not None and spec.fuel is FuelKind.LNG:
-        unrepresented = [name for name in lng_composition.components if name not in names]
+        try:
+            mapped_components = lng_composition.cantera_mole_fractions()
+        except ValueError as error:
+            raise MechanismError(str(error)) from error
+        unrepresented = [name for name in mapped_components if name not in names]
         if unrepresented:
             raise MechanismError(
                 f"LNG components {', '.join(unrepresented)} are absent from mechanism "

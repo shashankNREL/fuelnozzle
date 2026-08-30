@@ -8,6 +8,13 @@ from math import isfinite
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+COOLPROP_TO_CANTERA_SPECIES = {
+    "Methane": "CH4",
+    "Ethane": "C2H6",
+    "Propane": "C3H8",
+    "Nitrogen": "N2",
+}
+
 
 class WarningSeverity(StrEnum):
     """Severity attached to an engineering model warning."""
@@ -58,6 +65,23 @@ class LNGComposition(BaseModel):
     @property
     def is_pure(self) -> bool:
         return len(self.mole_fractions) == 1
+
+    def cantera_mole_fractions(self) -> dict[str, float]:
+        """Map thermodynamic-fluid names onto kinetic-mechanism species names."""
+        unmapped = [
+            component
+            for component in self.mole_fractions
+            if component not in COOLPROP_TO_CANTERA_SPECIES
+        ]
+        if unmapped:
+            raise ValueError(
+                "No Cantera species mapping is declared for LNG components "
+                f"{', '.join(unmapped)}"
+            )
+        return {
+            COOLPROP_TO_CANTERA_SPECIES[component]: fraction
+            for component, fraction in self.mole_fractions.items()
+        }
 
 
 @dataclass(frozen=True)

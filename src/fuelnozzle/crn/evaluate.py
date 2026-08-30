@@ -34,6 +34,8 @@ from fuelnozzle.crn.chemistry import (
     stoichiometric_air_fuel_ratio,
 )
 from fuelnozzle.crn.design import DesignVector, MissionPoint
+from fuelnozzle.crn.hardware import AirflowMode, DualFuelHardware
+from fuelnozzle.crn.mission import MissionProfile, mission_point_from_operating
 from fuelnozzle.crn.network import CombustorNetwork, NetworkError
 from fuelnozzle.crn.reactors import InletSpec, OutletSpec
 from fuelnozzle.crn.status import GateResult, GateStatus, aggregate_gate_status
@@ -47,6 +49,7 @@ from fuelnozzle.crn.templates import (
     rql_architecture,
 )
 from fuelnozzle.models import ModelWarning, WarningSeverity
+from fuelnozzle.operating import OperatingPoint
 
 #: Temperatures at which ignition delay is tabulated once per fuel.
 IGNITION_TABLE_TEMPERATURES_K = (650.0, 700.0, 750.0, 800.0, 850.0, 900.0, 1000.0)
@@ -127,22 +130,34 @@ class DesignEvaluator:
     def __init__(
         self,
         registry: MechanismRegistry,
-        mission: tuple[MissionPoint, ...] | list[MissionPoint],
+        mission: (
+            MissionProfile
+            | tuple[MissionPoint | OperatingPoint, ...]
+            | list[MissionPoint | OperatingPoint]
+        ),
         architecture: str = "rql",
         lng_architecture: str | None = None,
         minimum_autoignition_margin: float = 4.0,
+        hardware: DualFuelHardware | None = None,
     ) -> None:
         if architecture not in ARCHITECTURES:
             raise ValueError(f"Unknown architecture {architecture!r}")
         if lng_architecture is not None and lng_architecture not in ARCHITECTURES:
             raise ValueError(f"Unknown architecture {lng_architecture!r}")
+        source_points = mission.points if isinstance(mission, MissionProfile) else mission
         self.registry = registry
-        self.mission = tuple(mission)
+        self.mission = tuple(
+            mission_point_from_operating(point, hardware.sector if hardware else None)
+            if isinstance(point, OperatingPoint)
+            else point
+            for point in source_points
+        )
         self.architecture = architecture
         # The two fuel paths are separate hardware, so they may use different
         # architectures while sharing one liner.
         self.lng_architecture = lng_architecture or architecture
         self.minimum_margin = minimum_autoignition_margin
+        self.hardware = hardware
         self._tables: dict[tuple[FuelKind, float], IgnitionDelayTable] = {}
         self._afr: dict[FuelKind, float] = {}
 
@@ -167,16 +182,47 @@ class DesignEvaluator:
         return self._tables[key]
 
     def _build(self, design: DesignVector, point: MissionPoint) -> Architecture:
+        split = design.air_split(point.fuel)
+        zone_volumes = (
+            design.quench_volume_m3,
+            design.flame_volume_m3,
+            design.post_volume_m3,
+        )
+        if self.hardware is not None:
+            zone_volumes = self.hardware.liner.zone_volumes_m3
+            split = split.model_copy(
+                update={
+                    "cooling_destination": self.hardware.liner.cooling_destination,
+                    "jet_a_passage_share": self.hardware.jet_a_passage_share,
+                }
+            )
+        if (
+            self.hardware is not None
+            and self.hardware.airflow_mode is AirflowMode.AREA_DERIVED
+        ):
+            stations = point.pressure_stations
+            if stations is None or stations.liner_pressure_loss_pa <= 0.0:
+                raise ValueError(
+                    "Area-derived hardware requires a canonical operating point with "
+                    "positive liner pressure loss"
+                )
+            split = self.hardware.liner.area_derived_split(
+                stations.compressor_discharge_pa,
+                stations.combustor_exit_pa,
+                point.air_temperature_k,
+                jet_a_passage_share=self.hardware.jet_a_passage_share,
+                idle_passage_mixing_fraction=design.idle_passage_mixing_fraction,
+            )
         inputs = ArchitectureInputs(
             fuel=point.fuel,
             fuel_mass_flow_kg_s=point.fuel_mass_flow_kg_s,
             total_air_mass_flow_kg_s=point.air_mass_flow_kg_s,
             air_temperature_k=point.air_temperature_k,
-            air_split=design.air_split(point.fuel),
+            air_split=split,
             stoichiometric_air_fuel_ratio=self.stoichiometric_afr(point.fuel),
-            quench_volume_m3=design.quench_volume_m3,
-            flame_volume_m3=design.flame_volume_m3,
-            post_volume_m3=design.post_volume_m3,
+            quench_volume_m3=zone_volumes[0],
+            flame_volume_m3=zone_volumes[1],
+            post_volume_m3=zone_volumes[2],
         )
         builder = ARCHITECTURES[self.architecture_for(point.fuel)]
         if builder is rql_architecture:
@@ -290,6 +336,20 @@ class DesignEvaluator:
                     "experimental validation for design acceptance"
                 ),
                 evidence="docs/CRN_EQUATION_REGISTER.md",
+            ),
+            GateResult(
+                name="canonical_hardware",
+                status=(
+                    GateStatus.PASS
+                    if self.hardware is not None and point.operating_point is not None
+                    else GateStatus.UNKNOWN
+                ),
+                reason=(
+                    "mission point and shared hardware are explicitly defined"
+                    if self.hardware is not None and point.operating_point is not None
+                    else "legacy mission input or shared hardware definition is missing"
+                ),
+                evidence="fuelnozzle.crn.mission and fuelnozzle.crn.hardware",
             ),
         ]
         if ignition is not None and ignition.verdict is not AutoignitionVerdict.NO_PREMIXER:
