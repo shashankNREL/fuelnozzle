@@ -815,3 +815,609 @@ Cumulative test counts, so regressions in the existing package are visible immed
 | 2026-08-28 | **Phase 2 complete** (2.1-2.6 droplets, liquids, spray bridge) | 21 pass | **76 pass** | **97 pass**; `ruff` clean |
 | 2026-08-28 | **Phase 1 complete** (1.1 API, 1.2 chemistry, 1.3 validation, 1.4 streams) | 21 pass | **29 pass** | **50 pass**; `ruff` clean; both PDFs build |
 | 2026-08-28 | **Phase 0 complete** (0.2 scaffold, 0.3 LaTeX, 0.4/0.5 mechanisms) | 21 pass | 0 | 21 pass; `ruff` clean; both PDFs build |
+
+---
+
+## 6. Independent physics and equation audit (2026-08-30)
+
+### 6.1 Scope, intended use, and disposition
+
+This audit reviewed commit `1f8ef3e7` with the requested use case held fixed:
+
+- Jet-A at all four ICAO landing-and-take-off (LTO) modes;
+- LNG at a representative cruise condition;
+- separate fuel injectors, one active fuel at a time, and a shared liner; and
+- a conceptual design result, not merely a demonstration that a CRN can run.
+
+The review traced the production data path from `OperatingPoint` and the nozzle solvers
+through spray, thermal, chemistry, network, emissions, objective, and optimization code. It
+also compared implementation claims against the tests and CRN documentation. No source-code
+fixes were made as part of this audit.
+
+**Disposition: no-go for physics-based conceptual design in the current state.** The branch
+is a useful research prototype for isolated equation studies and qualitative sensitivity
+work. It is not yet suitable for selecting a dual-fuel architecture, sizing a combustor, or
+reporting a Jet-A LTO optimum or LNG cruise lean limit. Several design-driving quantities are
+either disconnected from the evaluator, represented by invalid proxies, or computed with a
+different model than the documentation describes. The existing validation disclaimers in
+the README and V&V roadmap therefore govern all current use.
+
+Severity in this section has the following meaning:
+
+- **Blocker:** can reverse an architecture/design decision, violate conservation, or return
+  an unsafe state as acceptable.
+- **Major:** important model-form omission or equation limitation that prevents quantitative
+  use but does not always invalidate a qualitative trend.
+- **Moderate:** robustness, traceability, or reporting issue that must be resolved before a
+  defensible release.
+
+### 6.2 What is physically sound or useful
+
+The following foundations should be retained:
+
+1. Keeping the fuels mutually exclusive at an operating point and providing separate fuel
+   hardware is appropriate for the stated concept.
+2. CoolProp-based LNG state calculations, explicit pressure budgets, and suppression of
+   uncalibrated LNG and Jet-A SMD values are sound modeling practices.
+3. Cantera is used correctly for stoichiometric AFR, element-based equivalence ratio, Bilger
+   mixture fraction, and finite-rate homogeneous chemistry.
+4. The NOx emission index correctly treats NO as NO2-equivalent mass. The standalone
+   `lto_dp_foo()` arithmetic and the ICAO time-in-mode table are also correct.
+5. The dedicated network and ignition-delay mechanisms acknowledge an important physical
+   fact: a high-temperature Jet-A mechanism cannot safely screen low-temperature
+   autoignition.
+6. The hand-solved minimum-norm flow-correction fixture, analytical droplet limits, element
+   accounting, and explicit warning objects are useful software-verification foundations.
+7. The code correctly refuses to invent a flashback result when no laminar flame speed is
+   supplied and correctly labels many spray correlations as requiring calibration.
+
+These points do not offset the blockers below because most are not connected into one
+conservative, mission-level design evaluation.
+
+### 6.3 Blocking findings
+
+| ID | Finding and physical consequence | Evidence |
+|---|---|---|
+| B-01 | **The design evaluator bypasses the advertised nozzle-to-combustor chain.** It injects both fuels as prescribed, fully gaseous streams. Injector geometry, LNG flash quality, droplet distribution, evaporation, TAB breakup, spray calibration, and liquid carryover therefore have no effect on the optimized design. A cold liquid fuel is represented as cold gas without paying the latent-heat requirement. | `crn/evaluate.py:181-198`; contrast `crn/__init__.py:3-7` and `crn/coupling.py` |
+| B-02 | **A configured architecture pair is not closed as one physical shared liner.** The evaluator can assign a Jet-A topology and a separate LNG topology, but this is a logical pairing of templates. It does not demonstrate that their different zone connections, air-entry locations, effective areas, swirler/injector footprints, and recirculation structures coexist in one geometry. Topology is an evaluator setting rather than a design variable. | `crn/evaluate.py:114-137,156-171`; `crn/templates.py`; `CRN_PLAN.md:863-864,1345-1346` |
+| B-03 | **A declared PFR is actually one fully back-mixed PSR.** `plug_flow_segments` and `segment_volume_m3` are never consumed by `CombustorNetwork.solve()`. The post-flame volume, where thermal NO can continue to form, consequently has the wrong residence-time distribution. The production PFR convergence test manually builds unrelated PSRs and cannot catch this defect. | `crn/reactors.py:54-83`; `crn/network.py:309-317`; `tests/test_crn_verification.py:207-237`; `crn_technical_reference.tex:535-538` |
+| B-04 | **Nominal, simulated, and reported reactor residence times are inconsistent.** A constant-pressure Cantera reactor is seeded hot at the nominal volume; its initial mass is then retained while its volume changes with state. Extraction instead reports `rho_converged * volume_nominal / mdot`. The seed composition is also formed by mass-flow-weighting inlet mole fractions rather than combining inlet molar flows. Quench time, extinction, NO residence, and volume optimization therefore do not necessarily use the physical volume or inventory shown to the user. | `crn/network.py:305-317,442-468` |
+| B-05 | **Adding fuel makes the air-only template internally inconsistent and invokes an unphysical flow repair.** The minimum-norm correction redistributes the missing fuel mass among forward and recirculation edges rather than constructing physically complete flows. It is unweighted, so edges with different uncertainty and physical roles receive equal mathematical treatment. | `crn/templates.py:398-440`; `crn/evaluate.py:181-198`; `crn/network.py:65-172` |
+| B-06 | **A negative corrected flow is still accepted.** The solver omits its mass-flow controller, but `inflow_of()` and residence-time reporting retain the signed value. The graph that is solved is therefore different from the graph that is balanced and reported. Global balance also does not guarantee balance of disconnected components. | `crn/network.py:130-143,253-261,334-339` |
+| B-07 | **The stated air-system and pressure-loss physics are absent.** `liner_pressure_loss_fraction` is unused; all reactors are assigned one pressure; air fractions are fixed inputs rather than results of effective area, discharge coefficient, density, and pressure ratio; and recirculation flows are prescribed rather than momentum- or pressure-driven. The same fractions are reused at LTO and cruise. This prevents a fixed liner from being evaluated consistently across the mission. | `operating.py:42-49`; `crn/network.py:300-345`; `crn/design.py:73-117`; `crn/templates.py` |
+| B-08 | **Spray coupling omits the breakup it advertises.** `apply_aerodynamic_breakup` is created but never consumed, so the TAB fallback has no effect. The TAB step response itself omits the exponential/sine terms of the documented damped oscillator and rejects all overdamped breakup, although a sufficiently large constant forcing can produce monotonic distortion. | `crn/spray_source.py:213-224`; `crn/coupling.py:311-342`; `crn/droplets.py:137-219`; `crn_technical_reference.tex:374-419` |
+| B-09 | **Droplet transport, mass, and integrated energy closure are incomplete.** Injection velocity is used as the gas-relative velocity through every zone; there is no drag, slip relaxation, trajectory, or gas velocity. Local fuel-vapor mass fraction is forced to zero, so vapor accumulation cannot inhibit evaporation. Coupling reconstructs heat from zone endpoints and has no explicit liquid outlet enthalpy ledger. Radius evolution uses instantaneous density without its temperature derivative, while evaporated fraction assumes constant density; the physical mass implied by `rho(T) * volume` can therefore change during heating while reported mass remains fixed, especially for LNG. | `crn/coupling.py:297-390`; `crn/droplets.py:279-300,332-357,450-472` |
+| B-10 | **The LNG droplet treatment is not a flashing model.** Vaporization is powered only by gas convection, not by a metastable droplet's own superheat. A droplet initialized above saturation receives zero temperature derivative and remains superheated rather than being driven to saturation. Vapor and liquid phase compositions from a multicomponent flash are collapsed into one species. | `crn/droplets.py:310-335,399-472`; `crn/coupling.py:67-91,216-274` |
+| B-11 | **Runtime chemistry validation never runs.** Mechanism species/pathway and range checks are called only by tests. The production evaluator can therefore use GRI-Mech 3.0 above its stated pressure basis or a mechanism with missing fuel/NOx coverage without the documented runtime warning. Species presence is also not evidence that the relevant NOx reactions or pathway rates are adequate. | `crn/chemistry.py:208-315`; no production callers |
+| B-12 | **Real LNG composition cannot propagate into combustion.** CoolProp names such as `Methane` are compared literally with Cantera names such as `CH4`, so even represented C1-C3 components fail the guard. More importantly, `MechanismSpec.fuel_mole_fractions` is independent of `LNGComposition`; the main path always burns pure CH4 even if nozzle properties use a mixture. This makes phase behavior, stoichiometric AFR, phi, ignition, flame speed, and emissions compositionally inconsistent. | `models.py:36-55`; `crn/chemistry.py:266-273`; `examples/run_combustor_study.py:64-78` |
+| B-13 | **Unknown autoignition states are returned as safe.** An out-of-table query and “did not ignite during the integration horizon” both become `None`, and `None` becomes `SAFE`. A query above the 1000 K table ceiling is thus labeled safe exactly where ignition delay is shortest. Pressure and phi are nearest-neighbor selections, with no stoichiometric point in the default grid. | `crn/autoignition.py:245-272,301-320`; `crn/evaluate.py:49-57,145-153` |
+| B-14 | **Autoignition is disconnected from the physical passage.** The screen uses total dome air rather than the active-passage air plus the specified mixed share of idle-passage air. The design residence-time scalar does not change premixer volume, flow, mixing, evaporation, or network solution. The hypothetical fast-NTC A2 variant is conservative but is not a validated Jet-A uncertainty bound. | `crn/evaluate.py:262-293`; `crn/design.py:105-113`; `mech/README.md:33-44` |
+| B-15 | **The Jet-A objective is not an ICAO LTO objective.** `weighted_ei_nox()` time-weights emission indices instead of weighting by fuel mass burned. The correct `sum(EI * mdot_f * time)` Dp/Foo helper exists but is disconnected from optimization. The example evaluates one takeoff-like point, not takeoff, climb-out, approach, and idle. | `crn/evaluate.py:98-108`; `crn/objectives.py:113-128`; `crn/emissions.py:130-231`; `examples/run_combustor_study.py:169-207` |
+| B-16 | **The LNG cruise lean limit is not implemented.** There is no continuation to extinction, combustion-efficiency threshold, calibrated CO criterion, or dynamic/flameholding screen. A hot-initialized temperature threshold is not lean blowout. The example prints a five-point model sweep and calls the result a limit. | `crn/network.py:381-411`; `examples/run_combustor_study.py:222-242`; `CRN_PLAN.md:946-973` |
+| B-17 | **Two optimization objectives are not the quantities their names imply.** “Mixing nonuniformity” is the range of mean phi among serial and functionally different zones; “exit temperature spread” is the range across every reactor. Neither represents unmixedness, an exit traverse, radial temperature distribution, or pattern factor. `rank_key()` then adds g/kg, kelvin, and dimensionless values, making the ranking depend on units and numerical scale. | `crn/evaluate.py:233-257`; `crn/objectives.py:113-144` |
+| B-18 | **The example's LNG path is physically wrong.** It supplies `jet_a_liquid()` to the methane case, describes the fuel as vapor-fed while creating zero initial vapor and a liquid droplet population, and uses Jet-A fuel flow in the LNG premix calculation. It therefore cannot serve as a reference result. | `examples/run_combustor_study.py:97-115,210-263` |
+| B-19 | **The model has no combustor geometry closure.** Absolute sector volumes and mass flows are accepted without an annulus, cup count, reference area, length, liner effective areas, jet momentum, dome swirler, or periodic-sector scaling check. It cannot produce the promised combustor dimensions or show that a selected set of volumes fits the shared hardware and pressure-loss budget. | `crn/design.py`; `crn/templates.py`; `operating.py:12-55` |
+| B-20 | **No experimental validation supports design acceptance.** The 255 reported tests primarily verify code identities, monotonic trends, or internally generated regressions. The John et al. case does not reconstruct their unpublished topology or data, the RQL optimum was used to tune model defaults, and no experimental dataset is read by CRN tests. | `tests/test_crn_verification.py`; `docs/V_AND_V_ROADMAP.md:455-459` |
+| B-21 | **The nozzle-layer “cruise” reference condition is not a representative combustor inlet.** `examples/run_study.py` and many LNG nozzle tests use `P3 = 0.1 MPa`, while the CRN example uses about `2 MPa`. This greatly changes LNG saturation margin, pressure ratio, choking, flash quality, and spray regime. No engine cycle deck or plausibility check prevents the 1-atm case from being read as a cruise-combustor design result. | `examples/run_study.py:45`; `examples/run_combustor_study.py:53-54`; `tests/test_lng_equilibrium.py`; `tests/test_lng_relaxation.py`; `tests/test_spray.py` |
+
+### 6.4 Major model-form and equation limitations
+
+#### 6.4.1 Network, mixing, heat transfer, and numerics
+
+1. All reactor kinds map to the same constant-pressure stirred-reactor class. They are
+   adiabatic by default, with only optional fixed-watt heat sources; “evaporator” and
+   “mixer” are labels unless the separate coupling path is explicitly used.
+2. Steady convergence checks temperature change only. Slow species, especially NO, can still
+   change after temperature appears stationary. Species, energy, mass, and ODE residuals are
+   not convergence criteria.
+3. Hot equilibrium initialization finds a lit branch; it does not show that a flame can
+   ignite, remain attached, or recover after a disturbance. Cold/hot multiplicity and
+   hysteresis are not mapped.
+4. Fixed heat-loss watts are not related to liner area, wall temperature, emissivity,
+   coolant flow, or heat-transfer coefficients. Rich Jet-A zones can also radiate through
+   soot, which is not modeled.
+5. `CoolingAirDestination` is unused. Cooling air always enters the downstream post-flame
+   zone, so primary-zone film cooling, dilution, and exhaust routing cannot be distinguished.
+6. The quench is an arbitrary staged-PSR schedule. Refinement of that schedule demonstrates
+   numerical consistency with the assumed mixer, not physical quench-jet mixing or scalar
+   dissipation. The RQL optimum's strong dependence on quench fraction is therefore expected
+   model-form sensitivity, not validation.
+7. Recirculation ratio and zone volumes are fixed across operating conditions. Neither is
+   linked to swirler aerodynamics, density, pressure loss, or flame state.
+8. The solver's integration-horizon estimate is documented as using cold density but is
+   normally evaluated from the hot ignition seed, which can understate the time required for
+   a cold or extinguished state.
+9. Mechanism extrapolation and some unexecuted safety checks do not prevent design
+   acceptance. Network non-convergence itself is correctly propagated as an infeasible
+   point.
+
+#### 6.4.2 Jet-A atomization and evaporation
+
+1. Jet-A is a single pseudo-component with one boiling point, molecular weight, diffusivity,
+   and vapor-pressure relation. It cannot represent the roughly 100 K distillation range,
+   preferential evaporation, or changing vapor composition of a real kerosene.
+2. The pressure-swirl model is a screening construction, not a validated simplex-atomizer
+   solution. Flow is sized with the full exit area and a prescribed discharge coefficient,
+   after which an air core is inferred; swirl is capped by available energy. These steps need
+   hardware data before air-core, film, cone, cavitation, or turndown decisions.
+3. The default pressure-swirl discharge coefficient is `0.65`, while the repository's own
+   cited Lacava case reports about `0.273`. Because predicted flow is linear in this
+   coefficient, the default is not a transferable pressure-swirl value and can materially
+   under-size area unless hardware data replace it.
+4. The optional SMD relation lacks an external-air breakup model and is intentionally
+   calibration-dependent. Ambient gas density is calculated but does not enter the SMD
+   relation, so the calibrated SMD has no chamber-pressure dependence. A scalar calibration
+   at one LTO mode cannot establish transfer to the others.
+5. Rosin-Rammler midpoint classes only approximately reconstruct the requested D32 at
+   practical class counts. The 400-class reconstruction test does not establish convergence
+   for the default class count used in coupled runs.
+6. Wall impingement, film formation, splash, multi-orifice interaction, spray cone
+   dispersion, and circumferential maldistribution are absent. These omissions are
+   especially important for idle CO/UHC and liner temperature.
+
+#### 6.4.3 LNG nozzle, thermal management, and phase behavior
+
+1. Tier 2 imposes a linear pressure path and equilibrium velocity, then relaxes quality in
+   time. The reported bounded mass flux need not equal `actual_density * velocity`. Diameter
+   is calculated afterward and does not participate in momentum, pressure, or residence-time
+   closure. The current model can screen a relaxation length but cannot establish an `L/D`
+   design rule.
+2. For a choked case, the CFD boundary is reported at chamber pressure while the operating
+   flux is taken at the upstream critical point. Boundary density, velocity, area, and mass
+   flow therefore need not satisfy continuity.
+3. The regime classifier can call a case fully flashing from pressure ratio or Jakob number
+   even when the finite-rate exit quality remains small. This is a screening label, not a
+   phase-distribution prediction.
+4. `thermal_window()` checks feed-line subcooling at feed pressure but computes heating duty
+   at chamber pressure. The heat-addition path must be evaluated at the actual pressurized
+   feed state, followed by the nozzle expansion/flash.
+5. For multicomponent LNG, a temperature just above the bubble point is reported with quality
+   one; the bubble-to-dew enthalpy interval is labeled entirely latent even though it includes
+   temperature glide. Total enthalpy and vapor quality should come directly from the
+   equilibrium state rather than pure-fluid logic.
+6. Target superheat is a temperature difference from chamber saturation, not an isenthalpic
+   flash quality. The actual design variable must close feed heating, nozzle pressure drop,
+   flashing, and downstream phase enthalpy in one path.
+7. The advertised four-way thermal window omits autoignition from
+   `ThermalWindowPoint`. Available aircraft/engine heat is a scalar ceiling rather than a
+   heat-exchanger effectiveness, pinch, pressure-drop, mass, and mission analysis.
+8. Idle Jet-A coking and idle-LNG vapor-lock are threshold screens and are not called by the
+   design evaluator. They do not model thermal soak, wetted volume, purge, restart, deposits,
+   or fuel switching.
+9. The feed-line two-phase model is deliberately treated as an error state, but if retained
+   for diagnosis it also needs acceleration pressure drop, minor-loss treatment, and
+   two-phase heat-transfer/flow-regime validation.
+10. When a feed line is present, its calculated outlet enthalpy is retained but its
+    calculated outlet pressure is replaced by the independently requested nozzle-budget
+    pressure. A warning does not close these incompatible boundaries; the feed and nozzle
+    must be solved as one pressure/enthalpy path or rejected.
+
+#### 6.4.4 Chemistry, emissions, ignition, and operability
+
+1. GRI-Mech 3.0 is a reasonable methane screening mechanism, but its commonly stated
+   optimization range extends only to roughly 10 atm. Cruise combustor calculations near
+   20 atm are extrapolative; higher-pressure C1-C3 chemistry and NOx pathways require
+   validation or a better-suited mechanism.
+2. `A2NOx_skeletal` is explicitly high-temperature chemistry. It should not be relied on for
+   reacting LPP premixer behavior, idle CO/UHC, or low-temperature ignition. Its declared
+   mechanism metadata also lacks pressure, temperature, phi, reduction-target, and error
+   ranges.
+3. `A2NTCfast_ske` is a hypothetical fast-NTC A2 sensitivity variant. Using it alone is a
+   conservative screen, not a quantified uncertainty band for Jet-A.
+4. The 400 K ignition temperature-rise marker is reproducible but not universal. Two-stage
+   ignition, cool flames, OH/CH2O markers, and maximum-temperature-rise-rate definitions can
+   give different delays. Constant-pressure ignition should also be reconciled with the
+   source experiments used to validate the mechanism.
+5. The premix enthalpy calculation evaluates gaseous fuel thermochemistry below the NASA
+   polynomial range: for example, LNG is evaluated at 150 K although GRI species
+   polynomials generally begin at 200 K. Liquid/flash enthalpy should enter through the
+   property model, not extrapolated ideal-gas methane.
+6. Cross-fuel absolute NOx comparison is not defensible with mechanisms of different
+   provenance, reduction error, and prompt/NNH pathway coverage. Relative conclusions must
+   survive mechanism substitution and experimental comparison.
+7. CO is explicitly uncalibrated, UHC is not actually aggregated, and no soot/nvPM model
+   exists. The Jet-A mechanism lacks the larger PAH population needed for soot prediction;
+   GRI-Mech has no aromatic/soot chemistry. These outputs cannot establish a quantitative
+   lean limit or ICAO nvPM result.
+8. The mean state of a 0-D reactor does not resolve the temperature/composition PDF that
+   controls thermal NOx. Until CFD/rig calibration supplies residence, mixing, and
+   unmixedness information, absolute NOx is a model output rather than a validated
+   prediction.
+9. Flashback is not connected to feasibility and uses an unvalidated generic turbulent
+   multiplier when invoked. Lean blowout, combustion efficiency, ignition energy,
+   light-around, altitude relight, fuel-transfer transients, thermoacoustics, and dynamic
+   stability are absent.
+10. A steady CRN is appropriate for stabilized point emissions but is not sufficient for
+    safety-critical premixer design or fuel-switch operability.
+
+#### 6.4.5 Mission aggregation, objectives, and optimization
+
+1. `MissionPoint` duplicates rather than adapts `OperatingPoint`. Combustor air flow, overall
+   phi, liner loss, thrust, wall temperature, pressure budget, sector multiplier, and nozzle
+   result are not closed in one canonical state.
+2. `thrust_fraction` is carried but does not affect physics or aggregation. Rated thrust is
+   absent from `DesignEvaluator`, so Dp/Foo cannot be a native objective.
+3. Autoignition margins between one and the requested design floor of four are correctly
+   converted into optimizer constraint violations. Unknown ignition delay and uninvoked
+   mechanism-range checks remain the unsafe gap.
+4. No constraint enforces combustion efficiency, material temperature, pressure loss, liner
+   cooling, pattern factor, nozzle turndown/cavitation, spray carryover, flashback, or
+   idle-circuit thermal limits in the production objective. Packaging is only a user-supplied
+   scalar budget, not a result of injector/liner geometry.
+5. Shared-liner optimum bracketing assumes the tuple is a sorted one-dimensional sweep. It is
+   invalid for unordered Latin-hypercube samples or a multidimensional design space.
+6. Sensitivity and Pareto tools operate on deterministic point values. Model-form,
+   mechanism, calibration, property, manufacturing, and operating-condition uncertainty are
+   not propagated into feasibility or ranking.
+
+### 6.5 Assessment of the stated assumptions
+
+| Assumption | Assessment for the target design |
+|---|---|
+| One active fuel at a time; separate fuel hardware | **Appropriate**, but purge, trapped fuel, switching transients, and inactive-circuit heat soak remain required operability cases. |
+| Shared liner | **Appropriate design question**, but the present model does not prove that its configurable Jet-A/LNG topologies and head-end routes coexist in one physical geometry. |
+| Steady state | **Acceptable for stabilized emissions screening.** Not acceptable by itself for ignition, LBO, relight, switching, or thermoacoustic stability. |
+| One representative sector | **Conditionally acceptable** when cup count, periodicity, mass-flow scaling, and sector volume are explicit. It cannot predict circumferential maldistribution or engine exit pattern factor. |
+| Constant combustor pressure | **Acceptable inside a calibrated chemical submodel**, but not as a substitute for the diffuser/liner pressure-loss and effective-area calculation that determines air split and jet momentum. |
+| Prescribed air split and recirculation | **Screening only.** It cannot identify a fixed shared-liner design across LTO and cruise without geometry/pressure coupling. |
+| PSR flame zones | **Acceptable only after CFD or rig calibration** of volume, residence-time distribution, and mixing. |
+| PFR post-flame zone | **Physically reasonable**, but not implemented in the production network. |
+| Adiabatic zones | **Useful upper-temperature sensitivity**, not adequate for quantitative RQL NOx, liner cooling, wall temperature, or pattern-factor design. |
+| Pure methane as LNG | **Not adequate** for a representative LNG design; C2/C3/N2 content and phase fractionation matter. |
+| Single pseudo-component Jet-A liquid | **Not adequate** for evaporation, ignition, CO/UHC, and soot-sensitive design; useful only for first-order hydraulic screening. |
+| Two different fuel mechanisms | **Scientifically necessary**, but cross-fuel absolute metrics need separate validation and uncertainty before comparison. |
+| Hot equilibrium initialization | **Useful for locating a lit steady branch**, not evidence of ignition or stability. |
+| Minimum ignition margin of four | **A tunable engineering screen, not a universal law.** It needs mechanism uncertainty, passage nonuniformity, wall effects, and rig evidence. |
+
+### 6.6 Documentation and traceability corrections required with the physics fixes
+
+1. Claims that PFR zones are PSR chains, TAB fallback is applied, every LNG
+   cooling-to-mixing link is computed, and mechanism validity is enforced at runtime are not
+   true for the production evaluator.
+2. `docs/modeling.md` retains stale RQL status.
+3. The technical reference has no complete bibliography or equation-to-source/validity-range
+   map and still contains “Pending” material despite being marked complete elsewhere.
+4. The John et al. exercise must be labeled a qualitative model-form comparison, not
+   validation. Its unpublished topology, volumes, spray propagation, and calibration cannot
+   be reconstructed.
+5. The adjusted RQL default that recovers a classical optimum is a calibration/sanity
+   choice. Tests using the same model are regression tests, not independent confirmation.
+6. Every future result must record mechanism hashes, property backend/version, fuel
+   composition, geometry revision, calibration identifiers, numerical settings, warning
+   disposition, and uncertainty interval.
+
+---
+
+## 7. Proposed remediation plan — awaiting approval
+
+No item below should be interpreted as implemented. Source changes should begin only after
+the plan is approved.
+
+### Stage 0 — protect users from unsupported conclusions
+
+1. Mark the current design evaluator as prototype/screening-only. Preserve distinct
+   **pass/fail/unknown** states and make unknown, non-converged, out-of-range, negative-flow,
+   and unvalidated safety results ineligible for design acceptance, never safe.
+2. Replace the example's design claims with reproducible diagnostics until the end-to-end
+   gates in Section 8 pass.
+3. Establish an equation/assumption register with source, validity range, uncertainty,
+   implementation symbol, verification test, and validation dataset for every
+   design-driving relation.
+
+**Exit gate:** the software cannot emit an apparently feasible design when a required
+physics or safety calculation was skipped.
+
+### Stage 1 — establish one mission and hardware state model
+
+1. Make `OperatingPoint` the canonical boundary condition and add an explicit adapter for
+   the four ICAO LTO points and representative cruise points from an engine cycle deck.
+2. Separate compressor discharge, dome, liner-zone, nozzle-inlet, critical, and chamber
+   pressures. Close pump/feed/nozzle and diffuser/liner pressure budgets.
+3. Define engine, annular, cup, and sector flow/volume scaling unambiguously.
+4. Define one shared physical liner and separate Jet-A and LNG fuel passages. Permit
+   fuel-specific head-end routing and schedules without silently changing shared geometry.
+5. Derive air splits at every operating point from effective areas, discharge coefficients,
+   local density, and pressure ratio; retain prescribed splits only as a documented
+   calibration mode.
+6. Carry representative LNG composition and phase compositions through CoolProp, Cantera,
+   stoichiometry, thermal, spray, and emissions interfaces with an explicit species-name map.
+
+**Exit gate:** every mass flow, pressure, temperature, composition, geometry, and sector
+volume has one source and can be traced from mission input to CRN boundary.
+
+### Stage 2 — correct reactor topology, conservation, and steady solution
+
+1. Expand every `ReactorKind.PFR` into the requested PSR chain, preserving total physical
+   volume, or use an independently cross-checked spatial PFR where network coupling permits.
+2. Rework reactor formulation so the simulated gas inventory equals
+   `rho_converged * physical_volume`; report actual Cantera mass and volume and reconcile
+   both with the residence-time definition.
+3. Construct initial compositions from species molar flows, not mass-flow-weighted mole
+   fractions, and initialize each reactor from a physically defined local state.
+4. Construct internal flows after all gas and droplet sources are known. Preserve
+   physically specified recirculation and staging rather than using fuel addition as a flow
+   “measurement error.”
+5. Replace unconstrained minimum-norm repair with uncertainty-weighted, nonnegative,
+   component-wise closure. Reject topology reversal and unresolved residuals.
+6. Converge temperature, all relevant species, reactor derivatives, mass, elements, and
+   energy. Cross-check time marching against Cantera steady solutions on tractable networks.
+7. Add hot/cold continuation and branch tracking for PSR extinction; keep ignition,
+   flameholding, and blowout conclusions distinct.
+8. Route cooling to its declared destination and replace free heat-loss watts with a
+   traceable wall/coolant model or an explicitly calibrated boundary.
+
+**Exit gate:** the exact production topology passes the analytical and conservation tests in
+Section 8 with no negative flow and grid-independent PFR/quench results.
+
+### Stage 3 — make nozzle, phase, spray, and CRN coupling conservative
+
+1. Feed the actual Jet-A and LNG nozzle results into every design evaluation; remove the
+   all-vapor shortcut from design acceptance.
+2. Replace the universal Jet-A discharge coefficient with a hardware/air-core closure and
+   validate liquid-sheet plus gas-driven breakup across the full LTO density range.
+3. Correct the damped TAB solution and invoke breakup when requested. Keep flash breakup and
+   aerodynamic breakup separate and calibrated.
+4. Add drag/slip relaxation and local gas velocity; propagate size, temperature, velocity,
+   and trajectory by class and zone.
+5. Integrate liquid mass directly, or include the density derivative consistently, so
+   variable-density heating cannot create or destroy liquid.
+6. Use local vapor composition in evaporation and close vapor inhibition, condensation
+   policy, and high-pressure applicability.
+7. Replace endpoint heat reconstruction with integrated gas-plus-liquid species, mass, and
+   enthalpy ledgers, including carryover.
+8. Add multicomponent Jet-A evaporation suitable for the required fidelity or explicitly
+   gate the single-component approximation to screening.
+9. Preserve LNG vapor and liquid phase compositions and use a flash/evaporation formulation
+   driven by liquid enthalpy as well as gas convection.
+10. Close choked nozzle and CRN boundary mass flux, density, velocity, pressure, quality, and
+   area. Calibrate finite-rate flashing before making an `L/D` recommendation.
+11. Add wall impingement/carryover bounds or declare geometries requiring those physics
+   outside the model domain.
+
+**Exit gate:** nozzle-to-exhaust mass, each element, and total enthalpy close within the
+proposed tolerances for zero, partial, and complete evaporation cases.
+
+### Stage 4 — correct LNG thermal management
+
+1. Calculate tank-to-injector duty along the actual feed-pressure/heat-exchanger path, then
+   perform the nozzle pressure/enthalpy flash separately.
+2. Use equilibrium quality and phase compositions throughout the mixture bubble/dew glide;
+   do not infer quality from a pure-fluid temperature test.
+3. Couple available heat to effectiveness, pinch, pressure loss, mass, control schedule, and
+   off-design heat source rather than a single scalar ceiling.
+4. Include actual autoignition state in the thermal window and treat an infeasible inverse
+   target as such rather than clamping it.
+5. Integrate idle-path thermal soak, purge, coking/deposit, vapor-lock, and restart screens
+   into mission feasibility.
+
+**Exit gate:** thermal-window points reproduce independent enthalpy/flash calculations and
+remain feasible at every required mission condition and uncertainty bound.
+
+### Stage 5 — establish chemistry and operability credibility
+
+1. Invoke mechanism validation before every solve and attach mechanism identity, range,
+   pathway, and extrapolation status to the result.
+2. Select and validate pressure-appropriate C1-C3 LNG chemistry and a representative LNG
+   composition; use GRI-Mech 3.0 only where its evidence supports it.
+3. Validate the Jet-A network mechanism against its source flame/speciation/NOx data and
+   bracket low-temperature ignition with defensible Jet-A mechanisms/data rather than one
+   hypothetical fast variant.
+4. Use multi-dimensional, bounded ignition interpolation in log delay and preserve separate
+   states for interpolated, censored-lower-bound, and unavailable results. Test multiple
+   ignition markers.
+5. Compute laminar flame speed where supported and calibrate flashback/turbulent-flame-speed
+   treatment to the actual passage.
+6. Implement a continuation-based LNG extinction/efficiency/CO bracket as a CRN lean-limit
+   screen, then calibrate it to high-pressure rig data.
+7. Add the pollutant fidelity needed for each claim. Do not claim quantitative CO, UHC,
+   soot, or nvPM until suitable chemistry/modeling and data exist.
+8. Keep transient ignition, relight, switching, and thermoacoustics as explicit external
+   gates unless a validated transient model is added.
+
+**Exit gate:** the lower confidence bound, not only the nominal mechanism, satisfies
+autoignition/flashback/LBO criteria, and emissions errors meet held-out acceptance targets.
+
+### Stage 6 — replace proxies and optimize only validated quantities
+
+1. Optimize Jet-A LTO Dp/Foo using all four modes and fuel-flow/time weighting. Retain
+   per-mode EI and constraint results so idle, approach, climb-out, and takeoff tradeoffs
+   remain visible.
+2. Define LNG cruise performance at named cruise points, not a generic “LNG” average.
+3. Replace serial-reactor phi range with a calibrated unmixedness/PDF metric. Replace
+   all-reactor temperature range with mass-weighted parallel exit-stream statistics or a
+   CFD/rig exit pattern factor.
+4. Make pressure loss, combustion efficiency, temperatures, cooling, carryover, nozzle
+   hydraulics, autoignition, flashback, idle thermal state, packaging, and operability
+   explicit constraints.
+5. Use nondimensional normalization only for a documented scalar preference; preserve the
+   Pareto front as the primary multi-objective result.
+6. Make sweep bracketing aware of the varied coordinate and sort/group samples before
+   endpoint tests. Use adaptive boundary expansion for single-fuel optima.
+7. Propagate input, calibration, mechanism, manufacturing, numerical, and model-form
+   uncertainty. Rank designs by robust feasibility and confidence intervals.
+8. Compare the shared-liner design against separately optimized Jet-A and LNG liners only
+   after all three designs use the same validation and uncertainty rules.
+
+**Exit gate:** the recommended design remains feasible and non-dominated under uncertainty,
+mechanism substitution, numerical refinement, and held-out validation cases.
+
+### Stage 7 — release a conceptual-design result
+
+1. Run the full LTO/cruise matrix, off-design corners, fuel-switch/idle-path external gates,
+   and uncertainty ensemble.
+2. Report dimensions, effective areas, pressure loss, flows, volumes, residence
+   distributions, injector ranges, thermal schedule, constraint margins, Pareto position,
+   and evidence grade.
+3. State which quantities are verified, validated, calibrated, extrapolated, or unavailable.
+4. Require independent technical review before lifting the no-go disposition.
+
+---
+
+## 8. Proposed verification and validation program
+
+Acceptance values below are initial engineering gates, not substitutes for dataset-specific
+measurement uncertainty. They should be finalized before calibration and never relaxed after
+seeing holdout results.
+
+### 8.1 Level V0 — equation, dimensional, and limit tests
+
+| Area | Required independent test |
+|---|---|
+| Units and dimensions | Check every public equation for dimensional homogeneity; test unit conversions and scale invariance. Use the existing unit package rather than duplicating formulas in tests. |
+| Pressure and flow | Verify SPI against a hand solution; recover the incompressible limit; demonstrate a back-pressure choking plateau; refine HEM pressure stations; require CFD-boundary `mdot = Cd * rho * u * A` consistency under the declared convention. |
+| Feed thermal/hydraulic | Zero-heat, heat-only, friction-only, hydrostatic-only, and minor-loss limits; verify `delta h = Qdot / mdot`; refine axial segmentation; compare two-phase pressure loss with an independent implementation. |
+| Thermodynamics | Compare methane and representative-LNG saturation, density, enthalpy, entropy, and PH/PS flash against NIST REFPROP/GERG-quality references, including points inside the bubble/dew glide and near critical conditions. |
+| Reactor algebra | Zero-fuel pass-through, long-PSR equilibrium, residence-time/inventory identity, analytical first-order PSR/PFR cases, disconnected-graph rejection, and exact nonnegative mass closure. |
+| PFR | Exercise `ReactorKind.PFR` itself; compare its segment chain with Cantera's independent PFR example and refine segment count. |
+| Droplets | D2-law, zero-relative-velocity, zero-vapor-driving-force, saturation inhibition, condensation policy, damped-TAB under/critical/overdamped limits, drag relaxation, and class mass/number conservation. |
+| Coupled energy | Nonreacting zero/partial/full evaporation with independent inlet/outlet gas-plus-liquid enthalpy; reacting adiabatic and prescribed-wall-heat cases; include carryover. |
+| Autoignition | Exact grid points, all grid faces/corners, T/P/phi refinement, out-of-range state, censored nonignition, and multiple ignition markers. |
+| Objectives | Hand-calculated four-mode Dp/Foo with unequal fuel flows; mass-weighted parallel exit statistics; invariance to unit rescaling; unordered/multidimensional sample bracketing. |
+
+The Jet-A injector suite must also include a discharge-coefficient/air-core benchmark against
+the cited pressure-swirl case and an LTO gas-density sweep. The latter must show the expected
+external-breakup/SMD pressure response rather than a pressure-independent calibrated value.
+
+Proposed numerical gates:
+
+- algebraic identities: relative error below `1e-10`;
+- full mass and elemental residual: below `1e-8` relative;
+- coupled enthalpy residual: below `0.1%`;
+- no negative or silently omitted flow;
+- HEM, feed, Tier-2, PFR, quench, and coupling refinement: below `0.5%` change
+  in hydraulic/quality outputs, `1%` in EI-NOx, and `2 K` in temperature; and
+- ignition interpolation error below `5%` against directly integrated points.
+
+Residuals must use declared scales. Use total positive inlet mass flow for total-mass
+normalization, incoming elemental mass flow for each materially present element, and the sum
+of absolute inlet/outlet/heat energy fluxes for enthalpy normalization. For a zero or trace
+quantity, use a predeclared absolute tolerance based on solver precision instead of dividing
+by a vanishing reference. Record both normalized and dimensional residuals.
+
+### 8.2 Level V1 — component validation
+
+1. **Properties:** methane reference EOS plus representative LNG mixtures. Initial targets:
+   pure-fluid density/saturation/enthalpy within `0.5%`, mixture thermodynamics within `2%`,
+   and transport within `10%`, unless source uncertainty is larger.
+2. **Critical flow:** ingest the bundled Hammer spreadsheet and the De Lorenzo and
+   Kim-O'Neal cases already identified in `V_AND_V_ROADMAP.md`. These validate model form;
+   they are not substitutes for LNG data.
+3. **Cryogenic spray:** use the identified liquid-nitrogen flash-spray datasets first, then
+   obtain direct liquid-methane or representative-LNG onset, mass-flow, cone, and size data
+   for a geometrically similar injector.
+4. **Jet-A nozzle/spray:** use independent pressure-swirl flow number, air-core/film, cone,
+   SMD/distribution, cavitation, and turndown data across LTO pressure/density conditions.
+5. **Jet-A evaporation:** validate multicomponent vaporization and composition history
+   against single-droplet or spray data at elevated pressure and temperature.
+6. **Jet-A chemistry:** replay the source HyChem POSF10325 ignition, flame-speed,
+   speciation, and NOx datasets, preserving train/holdout separation.
+7. **LNG chemistry:** validate the selected mechanism and representative compositions
+   against high-pressure ignition delay, laminar flame speed, extinction, JSR/PSR species,
+   and NOx/CO data over the cruise domain.
+8. **Mixing and cooling:** validate quench/dilution jet penetration and mixing with
+   Holdeman-type confined-crossflow data and cold-flow sector measurements; validate wall
+   heat/cooling against thermal data.
+
+Initial holdout targets:
+
+- nozzle mass flow within `5%`;
+- critical mass flux within `5-10%`;
+- cone angle within `5 deg` or measurement uncertainty;
+- SMD within `20%` or measurement uncertainty, with uncertainty bands achieving their
+  declared coverage;
+- ignition delay within a factor of two and no false-safe classification; and
+- PSR/JSR species and emissions within experiment-specific uncertainty targets.
+
+### 8.3 Level V2 — subsystem CRN validation
+
+1. Reconstruct published PSR/PFR/CRN cases without tuning their topology after inspecting the
+   answer.
+2. Calibrate zone volumes, flows, heat loss, and mixing to one CFD/rig subset; freeze them
+   before evaluating held-out operating conditions, traverses, and emissions.
+3. Use the John et al. liquid/gaseous comparison only as a qualitative model-form check
+   unless their topology and calibration data become available.
+4. Validate hot/cold branches, extinction residence time, and mechanism substitution.
+5. Compare local temperature/phi PDFs, recirculation, residence-time distributions,
+   pressure loss, exit traverse, and EI rather than calibrating only a single exit number.
+
+### 8.4 Level V3 — mission and hardware validation
+
+#### Jet-A LTO
+
+1. Use an engine cycle deck to define P3, T3, air flow, fuel flow, fuel temperature, pressure
+   loss, and scheduled geometry at takeoff, climb-out, approach, and idle.
+2. Validate sector-rig RQL/LDI pressure loss, pattern factor, efficiency, NOx, CO/UHC, LBO,
+   and wall temperatures at held-out conditions.
+3. Compare complete four-mode EI and Dp/Foo trends with the ICAO Aircraft Engine Emissions
+   Databank for an appropriate technology class. This is a model validation benchmark, not
+   a certification claim.
+
+#### LNG cruise
+
+1. Define top-of-climb, nominal cruise, and end-of-cruise points, plus fuel-composition and
+   heat-source envelopes.
+2. Validate representative-LNG flame stability, combustion efficiency, NOx/CO, pressure
+   loss, flash state, and exit traverse at pressure-matched conditions.
+3. Use PRECCINSTA or similar methane data only as a topology/trend check; a pressure- and
+   geometry-matched sector rig remains the acceptance evidence.
+
+Proposed system gates are exit temperature within `2%`, EI-NOx within `20%` or two combined
+standard uncertainties, and lean-limit phi within `0.03`, subject to tighter or looser
+dataset-specific uncertainty. For held-out pairwise design comparisons, require the predicted
+ordering of each named objective to match the measured ordering when the experimental 95%
+intervals do not overlap; treat overlapping intervals as a tie. Require Pareto dominance to
+use those same named objectives and uncertainty rule. An average error cannot hide a wrong
+mode trend.
+
+### 8.5 Level V4 — uncertainty, robustness, and credibility
+
+1. Separate numerical, input, parameter, mechanism, measurement, and model-form uncertainty
+   following ASME V&V 20 / NASA-STD-7009 principles.
+2. Publish calibration priors/ranges and posterior coverage; do not calibrate and validate on
+   the same operating points or geometry.
+3. Run global sensitivity and uncertainty propagation over composition, P3/T3, flow,
+   effective area, heat transfer, residence/mixing, mechanism, spray, and manufacturing
+   variables.
+4. Require safety margins at a predeclared one-sided 95% adverse confidence or credible
+   bound, with the statistical construction recorded, and require the preferred design to
+   remain non-dominated under plausible model substitution.
+5. Add continuous-integration regression cases for every accepted validation case, with raw
+   data checksum, source, preprocessing, software versions, and pass/fail metric.
+6. Use independent review to approve any change in model-form choice or acceptance threshold.
+
+### 8.6 Reference anchors for the remediation and V&V work
+
+The implementation should trace each equation to the exact edition/page or archival data
+record. The initial reference set is:
+
+- Cantera `continuous_reactor.py`, `combustor.py`, and `pfr.py` examples for CSTR residence,
+  PSR extinction continuation, and a reactor-chain PFR;
+- Lefebvre and Ballal, *Gas Turbine Combustion*, for architecture, pressure loss, cooling,
+  loading, and operability context;
+- Holdeman, “Mixing of Multiple Jets With a Confined Subsonic Crossflow,” for
+  quench/dilution mixing similarity;
+- Abramzon and Sirignano, “Droplet Vaporization Model for Spray Combustion Calculations,”
+  for a higher-fidelity evaporation reference;
+- Downar-Zapolski et al., “The Non-Equilibrium Relaxation Model for One-Dimensional Flashing
+  Liquid Flow,” for finite-rate flashing context;
+- Wang et al. and Xu et al., HyChem Parts I and II, plus Saggese et al., “HyChem V - NOx
+  Formation from a Typical Jet A,” for Jet-A chemistry provenance and validation;
+- Glarborg et al., *Progress in Energy and Combustion Science* 67 (2018), for nitrogen
+  chemistry assessment;
+- GRI-Mech 3.0 primary documentation and pressure/composition validation basis;
+- ICAO Annex 16 Volume II and the Aircraft Engine Emissions Databank for LTO definition and
+  comparison data; and
+- ASME V&V 20, AIAA G-077, Oberkampf and Roy, and NASA-STD-7009 for credibility and
+  uncertainty practice.
+
+---
+
+## 9. Approval gate
+
+The recommended implementation order is Stages 0-2 first, because unsafe status handling,
+mission-state closure, physical volume/residence, PFR topology, and conservative flow
+assembly can invalidate every later result. Stages 3-5 then establish the nozzle/spray,
+thermal, chemistry, and operability evaluator. Optimization in Stage 6 should not be used to
+select hardware until the relevant Section 8 component and subsystem gates pass.
+
+**No source implementation should begin until this audit and staged plan are approved.**
