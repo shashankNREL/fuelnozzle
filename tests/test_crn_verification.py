@@ -207,28 +207,27 @@ def test_zero_fuel_leaves_the_air_unchanged():
 def test_plug_flow_converges_with_segment_count():
     """A plug flow zone is a chain of stirred reactors; the answer must stop moving."""
     def exit_temperature(segments):
-        names = [f"seg_{index}" for index in range(segments)]
-        reactors = [
-            ReactorSpec(name=name, kind=ReactorKind.PSR, volume_m3=4.0e-3 / segments)
-            for name in names
-        ]
-        flows = {
-            (names[index], names[index + 1]): 1.035 for index in range(segments - 1)
-        }
         network = CombustorNetwork(
-            reactors,
+            [
+                ReactorSpec(
+                    name="post",
+                    kind=ReactorKind.PFR,
+                    volume_m3=4.0e-3,
+                    plug_flow_segments=segments,
+                )
+            ],
             [
                 InletSpec(
-                    name="air", target_reactor=names[0], mass_flow_kg_s=1.0,
+                    name="air", target_reactor="post", mass_flow_kg_s=1.0,
                     temperature_k=750.0, mole_fractions={"O2": 0.21, "N2": 0.79},
                 ),
                 InletSpec(
-                    name="fuel", target_reactor=names[0], mass_flow_kg_s=0.035,
+                    name="fuel", target_reactor="post", mass_flow_kg_s=0.035,
                     temperature_k=300.0, mole_fractions={"CH4": 1.0},
                 ),
             ],
-            OutletSpec(source_reactor=names[-1], mass_flow_kg_s=1.035),
-            flows,
+            OutletSpec(source_reactor="post", mass_flow_kg_s=1.035),
+            {},
         )
         return network.solve(gri30, PRESSURE_PA).outlet.temperature_k
 
@@ -381,6 +380,7 @@ def build_case(vaporized: bool):
             reactors, inlets,
             OutletSpec(source_reactor="post", mass_flow_kg_s=air_flow + fuel_flow),
             flows,
+            fixed_internal_flows={("flame", "recirc"), ("recirc", "mixer")},
         )
         from fuelnozzle.crn.coupling import CoupledSolution
 
@@ -392,7 +392,9 @@ def build_case(vaporized: bool):
 
     return solve_coupled(
         reactors, inlets, "post", flows, mechanism, PRESSURE_PA, spray,
-        jet_a_provider(), ("evap", "mixer"), "POSF10325", max_iterations=8,
+        jet_a_provider(), ("evap", "mixer"), "POSF10325",
+        fixed_internal_flows={("flame", "recirc"), ("recirc", "mixer")},
+        max_iterations=8,
     )
 
 
@@ -537,6 +539,7 @@ def rql_case(dome: float, stages: int, quench_volume_m3: float):
         architecture.reactors, inlets,
         OutletSpec(source_reactor=architecture.outlet_reactor, mass_flow_kg_s=air + fuel),
         architecture.internal_flows,
+        fixed_internal_flows=architecture.fixed_internal_flows,
     )
     solved = network.solve(mechanism, PRESSURE_PA)
     gas = mechanism()

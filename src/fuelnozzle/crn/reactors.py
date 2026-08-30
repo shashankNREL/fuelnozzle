@@ -56,6 +56,7 @@ class ReactorSpec(BaseModel):
 
     #: Heat removed from this zone, for liner loss. Positive means heat leaves the gas.
     heat_loss_w: float = Field(default=0.0, ge=0.0)
+    heat_loss_basis: str | None = Field(default=None, min_length=1)
 
     #: Average distance a droplet travels inside this zone. Droplets and gas do not
     #: travel together, so this is not derivable from the reactor's residence time.
@@ -72,6 +73,11 @@ class ReactorSpec(BaseModel):
             raise ValueError(
                 f"Reactor {self.name!r} is a {self.kind}; plug_flow_segments applies "
                 "only to plug flow zones."
+            )
+        if self.heat_loss_w > 0.0 and self.heat_loss_basis is None:
+            raise ValueError(
+                f"Reactor {self.name!r} has a prescribed heat loss without a calibration "
+                "or physical-model identifier"
             )
         return self
 
@@ -98,6 +104,7 @@ class InletSpec(BaseModel):
     mass_flow_kg_s: float = Field(ge=0.0)
     temperature_k: float = Field(gt=0.0)
     mole_fractions: dict[str, float] = Field(min_length=1)
+    at_reactor_exit: bool = False
 
     @model_validator(mode="after")
     def validate_composition(self) -> InletSpec:

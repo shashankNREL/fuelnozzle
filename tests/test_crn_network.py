@@ -8,8 +8,10 @@ import pytest
 
 from fuelnozzle.crn.network import (
     CombustorNetwork,
+    InitializationBranch,
     NetworkError,
     minimum_norm_mass_correction,
+    solve_continuation,
 )
 from fuelnozzle.crn.reactors import InletSpec, OutletSpec, ReactorKind, ReactorSpec
 
@@ -47,6 +49,16 @@ def test_only_droplet_hosting_zones_accept_a_spray_path():
         )
 
 
+def test_prescribed_heat_loss_requires_a_traceable_basis():
+    with pytest.raises(ValueError, match="without a calibration"):
+        ReactorSpec(
+            name="flame",
+            kind=ReactorKind.PSR,
+            volume_m3=1.0e-3,
+            heat_loss_w=1000.0,
+        )
+
+
 def test_kind_reports_whether_droplets_may_be_present():
     assert ReactorKind.EVAPORATOR.hosts_droplets
     assert ReactorKind.MIXER.hosts_droplets
@@ -65,7 +77,11 @@ def test_correction_matches_the_hand_solved_minimum():
     """
     flows = {("a", "b"): 1.10, ("b", "c"): 0.95, ("c", "a"): 0.30}
     report = minimum_norm_mass_correction(
-        ["a", "b", "c"], flows, {"a": 1.0}, {"c": 1.0}
+        ["a", "b", "c"],
+        flows,
+        {"a": 1.0},
+        {"c": 1.0},
+        flow_uncertainties_kg_s={edge: 1.0 for edge in flows},
     )
 
     assert report.corrected_flows[("a", "b")] == pytest.approx(1.1166667, rel=1e-6)
@@ -78,7 +94,11 @@ def test_correction_is_genuinely_minimum_norm():
     """Any other feasible solution must be a larger change than the one chosen."""
     flows = {("a", "b"): 1.10, ("b", "c"): 0.95, ("c", "a"): 0.30}
     report = minimum_norm_mass_correction(
-        ["a", "b", "c"], flows, {"a": 1.0}, {"c": 1.0}
+        ["a", "b", "c"],
+        flows,
+        {"a": 1.0},
+        {"c": 1.0},
+        flow_uncertainties_kg_s={edge: 1.0 for edge in flows},
     )
     chosen = np.array([report.correction[edge] for edge in flows])
 
@@ -130,7 +150,13 @@ def test_correction_closes_imbalances_of_the_magnitude_the_paper_reports():
         for (edge, flow), shift in zip(balanced.items(), perturbations, strict=True)
     }
     report = minimum_norm_mass_correction(
-        names, perturbed, {"evaporator": through}, {"post": through}
+        names,
+        perturbed,
+        {"evaporator": through},
+        {"post": through},
+        flow_uncertainties_kg_s={
+            edge: 0.1 * flow for edge, flow in perturbed.items()
+        },
     )
 
     assert report.initial_residual_kg_s > 0.0
@@ -156,16 +182,57 @@ def test_large_correction_is_reported():
     assert "LARGE_MASS_CORRECTION" in codes
 
 
-def test_correction_that_reverses_a_flow_is_reported():
-    """A negative corrected flow means the topology, not the numbers, is wrong."""
-    # Balance forces z_ab - z_ba = 1. Starting from flows summing to less than 1, the
-    # minimum-norm solution is z_ba = (0.1 + 0.2 - 1)/2 = -0.35, i.e. reversed.
+def test_correction_never_reverses_a_declared_flow():
+    """The old unconstrained solution made b->a negative and then silently omitted it."""
     flows = {("a", "b"): 0.1, ("b", "a"): 0.2}
-    report = minimum_norm_mass_correction(["a", "b"], flows, {"a": 1.0}, {"b": 1.0})
+    report = minimum_norm_mass_correction(
+        ["a", "b"],
+        flows,
+        {"a": 1.0},
+        {"b": 1.0},
+        flow_uncertainties_kg_s={edge: 1.0 for edge in flows},
+    )
 
-    assert report.corrected_flows[("b", "a")] == pytest.approx(-0.35, rel=1.0e-6)
-    codes = {warning.code for warning in report.warnings}
-    assert "MASS_CORRECTION_REVERSED_FLOW" in codes
+    assert report.corrected_flows[("a", "b")] == pytest.approx(1.0)
+    assert report.corrected_flows[("b", "a")] == pytest.approx(0.0)
+    assert report.final_residual_kg_s < 1.0e-12
+
+
+def test_infeasible_directed_topology_is_rejected_instead_of_reversed():
+    with pytest.raises(NetworkError, match="No nonnegative"):
+        minimum_norm_mass_correction(
+            ["a", "b"], {("b", "a"): 0.2}, {"a": 1.0}, {"b": 1.0}
+        )
+
+
+def test_underdetermined_correction_requires_declared_uncertainties():
+    with pytest.raises(NetworkError, match="requires an uncertainty"):
+        minimum_norm_mass_correction(
+            ["a", "b"],
+            {("a", "b"): 0.1, ("b", "a"): 0.2},
+            {"a": 1.0},
+            {"b": 1.0},
+        )
+
+
+def test_fixed_recirculation_is_preserved_while_through_flow_closes():
+    flows = {("a", "b"): 1.0, ("b", "loop"): 0.3, ("loop", "a"): 0.3}
+    report = minimum_norm_mass_correction(
+        ["a", "b", "loop"],
+        flows,
+        {"a": 1.1},
+        {"b": 1.1},
+        fixed_internal_flows={("b", "loop"), ("loop", "a")},
+    )
+    assert report.corrected_flows[("a", "b")] == pytest.approx(1.4)
+    assert report.corrected_flows[("b", "loop")] == pytest.approx(0.3)
+
+
+def test_disconnected_components_must_close_individually():
+    with pytest.raises(NetworkError, match="connected reactor component"):
+        minimum_norm_mass_correction(
+            ["a", "b"], {}, {"a": 1.0}, {"b": 1.0}
+        )
 
 
 def test_unknown_reactor_in_a_flow_raises():
@@ -193,6 +260,7 @@ def build_network(
         ReactorSpec(
             name="flame", kind=ReactorKind.PSR, volume_m3=flame_volume_m3,
             heat_loss_w=heat_loss_w,
+            heat_loss_basis="test calibration" if heat_loss_w > 0.0 else None,
         ),
         ReactorSpec(name="recirc", kind=ReactorKind.PSR, volume_m3=1.0e-3),
         ReactorSpec(name="post", kind=ReactorKind.PSR, volume_m3=4.0e-3),
@@ -229,6 +297,8 @@ def test_network_solves_and_conserves_elements():
 
     assert solution.converged
     assert solution.element_balance_error < 1.0e-5
+    assert solution.energy_balance_error < 1.0e-5
+    assert solution.convergence.scaled_state_derivative < 1.0e-6
 
 
 def test_recirculation_does_not_prevent_a_steady_solution():
@@ -259,6 +329,76 @@ def test_residence_time_follows_density_volume_over_mass_flow():
     flame = solution.by_name("flame")
     expected = 1.5e-3 * flame.density_kg_m3 / flame.mass_flow_kg_s
     assert flame.residence_time_s == pytest.approx(expected, rel=1.0e-9)
+    assert flame.mass_kg == pytest.approx(flame.density_kg_m3 * flame.volume_m3)
+    assert flame.inventory_relative_error < 1.0e-12
+
+
+def test_pfr_is_expanded_into_a_volume_preserving_chain():
+    flow = 1.0
+    network = CombustorNetwork(
+        [
+            ReactorSpec(
+                name="post",
+                kind=ReactorKind.PFR,
+                volume_m3=4.0e-3,
+                plug_flow_segments=4,
+            )
+        ],
+        [
+            InletSpec(
+                name="air",
+                target_reactor="post",
+                mass_flow_kg_s=flow,
+                temperature_k=750.0,
+                mole_fractions={"O2": 0.21, "N2": 0.79},
+            )
+        ],
+        OutletSpec(source_reactor="post", mass_flow_kg_s=flow),
+        {},
+    )
+    assert len(network.reactors) == 4
+    assert sum(spec.volume_m3 for spec in network.reactors) == pytest.approx(4.0e-3)
+    assert network.outlet.source_reactor == "post"
+    assert network.inlets[0].target_reactor == "post__pfr_001"
+    solution = network.solve(gri30, PRESSURE_PA)
+    assert len(solution.zone("post")) == 4
+    assert sum(reactor.volume_m3 for reactor in solution.zone("post")) == pytest.approx(
+        4.0e-3
+    )
+    assert solution.zone_residence_time_s("post") == pytest.approx(
+        sum(reactor.mass_kg / reactor.mass_flow_kg_s for reactor in solution.zone("post"))
+    )
+
+
+def test_initial_mixture_is_weighted_by_molar_not_mass_flow():
+    network = CombustorNetwork(
+        [ReactorSpec(name="mix", kind=ReactorKind.PSR, volume_m3=1.0e-3)],
+        [
+            InletSpec(
+                name="hydrogen",
+                target_reactor="mix",
+                mass_flow_kg_s=1.0,
+                temperature_k=300.0,
+                mole_fractions={"H2": 1.0},
+            ),
+            InletSpec(
+                name="carbon_dioxide",
+                target_reactor="mix",
+                mass_flow_kg_s=1.0,
+                temperature_k=300.0,
+                mole_fractions={"CO2": 1.0},
+            ),
+        ],
+        OutletSpec(source_reactor="mix", mass_flow_kg_s=2.0),
+        {},
+    )
+    composition, _enthalpy = network._initial_mixture(gri30, PRESSURE_PA)
+    gas = gri30()
+    expected_h2 = (1.0 / gas.molecular_weights[gas.species_index("H2")]) / (
+        1.0 / gas.molecular_weights[gas.species_index("H2")]
+        + 1.0 / gas.molecular_weights[gas.species_index("CO2")]
+    )
+    assert composition["H2"] == pytest.approx(expected_h2)
 
 
 def test_inflow_accounts_for_external_and_recirculated_streams():
@@ -280,6 +420,27 @@ def test_heat_loss_lowers_the_flame_temperature():
     adiabatic = build_network().solve(gri30, PRESSURE_PA)
     cooled = build_network(heat_loss_w=2.0e4).solve(gri30, PRESSURE_PA)
     assert cooled.by_name("flame").temperature_k < adiabatic.by_name("flame").temperature_k
+
+
+def test_hot_and_cold_initializations_are_tracked_separately():
+    branches = build_network().solve_branches(gri30, PRESSURE_PA)
+    assert branches.hot.initialization_branch is InitializationBranch.HOT
+    assert branches.cold.initialization_branch is InitializationBranch.COLD
+    assert branches.distinct
+
+
+def test_continuation_reuses_the_previous_state_on_one_named_branch():
+    solutions = solve_continuation(
+        [build_network(flame_volume_m3=2.0e-3), build_network()],
+        gri30,
+        PRESSURE_PA,
+        initialization_branch=InitializationBranch.HOT,
+    )
+    assert len(solutions) == 2
+    assert all(
+        solution.initialization_branch is InitializationBranch.HOT
+        for solution in solutions
+    )
 
 
 def test_extinguished_network_is_reported_not_returned_silently():

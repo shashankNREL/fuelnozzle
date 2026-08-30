@@ -23,7 +23,7 @@ from enum import StrEnum
 
 from fuelnozzle.crn.chemistry import DRY_AIR_MOLE_FRACTIONS, FuelKind
 from fuelnozzle.crn.reactors import InletSpec, ReactorKind, ReactorSpec
-from fuelnozzle.crn.streams import AirSplit
+from fuelnozzle.crn.streams import AirSplit, CoolingAirDestination
 from fuelnozzle.models import ModelWarning, WarningSeverity
 
 #: Rich-zone equivalence ratios outside this band are unusual for RQL and are flagged.
@@ -79,6 +79,7 @@ class Architecture:
     spray_path: tuple[str, ...]
     near_field_equivalence_ratio: float
     warnings: tuple[ModelWarning, ...]
+    fixed_internal_flows: frozenset[tuple[str, str]] = frozenset()
 
     @property
     def reactor_names(self) -> tuple[str, ...]:
@@ -114,13 +115,21 @@ class ArchitectureInputs:
     def air(self, fraction: float) -> float:
         return self.total_air_mass_flow_kg_s * fraction
 
-    def inlet(self, name: str, reactor: str, fraction: float) -> InletSpec:
+    def inlet(
+        self,
+        name: str,
+        reactor: str,
+        fraction: float,
+        *,
+        at_reactor_exit: bool = False,
+    ) -> InletSpec:
         return InletSpec(
             name=name,
             target_reactor=reactor,
             mass_flow_kg_s=self.air(fraction),
             temperature_k=self.air_temperature_k,
             mole_fractions=self.oxidizer,
+            at_reactor_exit=at_reactor_exit,
         )
 
 
@@ -174,6 +183,27 @@ def _near_field_inlets(
             )
         )
     return inlets, phi, warnings
+
+
+def _cooling_inlet(
+    inputs: ArchitectureInputs,
+    *,
+    primary_reactor: str,
+    dilution_reactor: str,
+    outlet_reactor: str,
+) -> InletSpec:
+    """Route liner cooling air to its declared physical re-entry location."""
+    destination = inputs.air_split.cooling_destination
+    if destination is CoolingAirDestination.PRIMARY:
+        return inputs.inlet("cooling_air", primary_reactor, inputs.air_split.cooling)
+    if destination is CoolingAirDestination.EXIT:
+        return inputs.inlet(
+            "cooling_air",
+            outlet_reactor,
+            inputs.air_split.cooling,
+            at_reactor_exit=True,
+        )
+    return inputs.inlet("cooling_air", dilution_reactor, inputs.air_split.cooling)
 
 
 def rql_architecture(
@@ -239,7 +269,14 @@ def rql_architecture(
     if inputs.air_split.primary > 0.0:
         inlets.append(inputs.inlet("primary_air", mixer, inputs.air_split.primary))
     if inputs.air_split.cooling > 0.0:
-        inlets.append(inputs.inlet("cooling_air", post, inputs.air_split.cooling))
+        inlets.append(
+            _cooling_inlet(
+                inputs,
+                primary_reactor=mixer,
+                dilution_reactor=post,
+                outlet_reactor=post,
+            )
+        )
 
     reactors = [
         ReactorSpec(
@@ -277,6 +314,7 @@ def rql_architecture(
         spray_path=(dome, mixer),
         near_field_equivalence_ratio=phi_rich,
         warnings=tuple(warnings),
+        fixed_internal_flows=frozenset({(mixer, recirc), (recirc, dome)}),
     )
 
 
@@ -300,7 +338,14 @@ def ldi_architecture(inputs: ArchitectureInputs) -> Architecture:
         inlets.append(inputs.inlet("quench_air", flame, inputs.air_split.quench))
     inlets.append(inputs.inlet("dilution_air", post, inputs.air_split.dilution))
     if inputs.air_split.cooling > 0.0:
-        inlets.append(inputs.inlet("cooling_air", post, inputs.air_split.cooling))
+        inlets.append(
+            _cooling_inlet(
+                inputs,
+                primary_reactor=mixer,
+                dilution_reactor=post,
+                outlet_reactor=post,
+            )
+        )
 
     reactors = [
         ReactorSpec(
@@ -330,6 +375,7 @@ def ldi_architecture(inputs: ArchitectureInputs) -> Architecture:
         spray_path=(dome, mixer),
         near_field_equivalence_ratio=phi_near,
         warnings=tuple(warnings),
+        fixed_internal_flows=frozenset({(flame, recirc), (recirc, dome)}),
     )
 
 
@@ -366,7 +412,14 @@ def lpp_architecture(
         inlets.append(inputs.inlet("quench_air", flame, inputs.air_split.quench))
     inlets.append(inputs.inlet("dilution_air", post, inputs.air_split.dilution))
     if inputs.air_split.cooling > 0.0:
-        inlets.append(inputs.inlet("cooling_air", post, inputs.air_split.cooling))
+        inlets.append(
+            _cooling_inlet(
+                inputs,
+                primary_reactor=premix,
+                dilution_reactor=post,
+                outlet_reactor=post,
+            )
+        )
 
     reactors = [
         ReactorSpec(
@@ -392,6 +445,7 @@ def lpp_architecture(
         spray_path=(premix,),
         near_field_equivalence_ratio=phi_near,
         warnings=tuple(warnings),
+        fixed_internal_flows=frozenset({(flame, recirc), (recirc, flame)}),
     )
 
 
@@ -423,7 +477,9 @@ def _chain_flows(
 
     if recirculation is not None:
         (source, loop, target), ratio = recirculation
-        rate = ratio * inputs.total_air_mass_flow_kg_s
+        rate = ratio * (
+            inputs.total_air_mass_flow_kg_s + inputs.fuel_mass_flow_kg_s
+        )
         if rate > 0.0:
             flows[(source, loop)] = rate
             flows[(loop, target)] = rate

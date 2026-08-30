@@ -253,6 +253,7 @@ class DesignEvaluator:
                 architecture.reactors, inlets,
                 OutletSpec(source_reactor=architecture.outlet_reactor, mass_flow_kg_s=total),
                 architecture.internal_flows,
+                fixed_internal_flows=architecture.fixed_internal_flows,
             )
             solution = network.solve(mechanism, point.pressure_pa)
         except (NetworkError, ValueError) as error:

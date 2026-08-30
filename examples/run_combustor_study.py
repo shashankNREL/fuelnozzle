@@ -157,7 +157,8 @@ def run_case(builder, fuel, fuel_flow, air_temperature_k, dome, share, afr, prov
         architecture.reactors, architecture.air_inlets, architecture.outlet_reactor,
         architecture.internal_flows, mechanism, PRESSURE_PA,
         spray(fuel, fuel_flow, radius_m, fuel_temperature_k), provider,
-        architecture.spray_path, fuel_species, max_iterations=10,
+        architecture.spray_path, fuel_species,
+        fixed_internal_flows=architecture.fixed_internal_flows, max_iterations=10,
     )
     outlet = result.network.outlet
     emissions = summarize_emissions(

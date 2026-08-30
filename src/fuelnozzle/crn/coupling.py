@@ -76,6 +76,9 @@ def solve_coupled(
     spray_path: tuple[str, ...] | list[str],
     fuel_species: str,
     *,
+    fixed_internal_flows: (
+        frozenset[tuple[str, str]] | set[tuple[str, str]] | None
+    ) = None,
     max_iterations: int = 20,
     relaxation: float = DEFAULT_RELAXATION,
     heat_transfer_scaling: float = 1.0,
@@ -119,6 +122,7 @@ def solve_coupled(
         network = _build(
             reactors, air_inlets, outlet_reactor, internal_flows,
             vapor, heat, base_heat, spray, fuel_species, air_total, path[0],
+            fixed_internal_flows,
         )
         solution = network.solve(solution_factory, pressure_pa)
 
@@ -225,6 +229,9 @@ def _build(
     fuel_species: str,
     air_total: float,
     first_zone: str,
+    fixed_internal_flows: (
+        frozenset[tuple[str, str]] | set[tuple[str, str]] | None
+    ),
 ) -> CombustorNetwork:
     """Assemble the network for one iteration.
 
@@ -260,9 +267,18 @@ def _build(
 
     specs = tuple(
         spec.model_copy(
-            update={"heat_loss_w": base_heat.get(spec.name, 0.0) + max(
-                heat.get(spec.name, 0.0), 0.0
-            )}
+            update={
+                "heat_loss_w": base_heat.get(spec.name, 0.0)
+                + max(heat.get(spec.name, 0.0), 0.0),
+                "heat_loss_basis": (
+                    spec.heat_loss_basis
+                    or (
+                        "coupled droplet sensible-plus-latent enthalpy"
+                        if heat.get(spec.name, 0.0) > 0.0
+                        else None
+                    )
+                ),
+            }
         )
         for spec in reactors
     )
@@ -271,6 +287,7 @@ def _build(
         inlets,
         OutletSpec(source_reactor=outlet_reactor, mass_flow_kg_s=air_total + gas_fuel),
         internal_flows,
+        fixed_internal_flows=fixed_internal_flows,
     )
 
 

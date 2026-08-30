@@ -1514,3 +1514,74 @@ Deviations from the approved plan:
   traceable calibration paths. They are not accepted as canonical design evidence.
 
 Verification at closure: 67 focused Stage 1/chemistry/design tests passed and Ruff passed.
+
+### 10.3 Stage 2 -- topology, conservation, inventory, and steady branches (in progress)
+
+Implemented:
+
+- `ReactorKind.PFR` now expands during `CombustorNetwork` assembly into the requested
+  equal-volume PSR chain. Incoming flows and ordinary inlets enter the first segment, the
+  outlet and outgoing flows leave the last, heat loss is divided without changing its total,
+  and cooling declared for the physical exit joins the last segment. The final segment keeps
+  the physical-zone name, while `NetworkSolution.zone()` exposes every numerical segment.
+- The historical `minimum_norm_mass_correction()` API now performs nonnegative,
+  uncertainty-weighted closure. It checks global and connected-component boundary balances,
+  preserves explicitly fixed recirculation flows, rejects negative inputs and infeasible
+  directed graphs, and rejects underdetermined repairs unless every adjustable flow has a
+  declared uncertainty. `close_internal_flows` is the preferred descriptive alias.
+- Fuel vapor and staged droplet sources are included before closure. Architecture templates
+  label their recirculation edges as fixed, so adding fuel changes the downstream through-flow
+  rather than redistributing the fuel residual into a recirculation loop. Recirculation ratio
+  is now based on total air-plus-fuel boundary flow rather than air alone.
+- `_initial_mixture()` converts each inlet mass flow to species molar flows before combining
+  mole fractions. It also computes the mass-flow-weighted inlet enthalpy used by cold and hot
+  seeds. The earlier mass-flow-weighting of mole fractions was dimensionally incorrect.
+- A constant-pressure Cantera reactor otherwise preserves its initial inventory and changes
+  volume as temperature and composition change. The solver now re-imposes each declared
+  physical control volume during time marching and reinitializes Cantera, so final reported
+  `mass_kg`, `volume_m3`, and residence time obey `mass = density * volume` and
+  `tau = mass / inflow`.
+- Convergence now requires temperature, every species mass fraction, mass inventory, enthalpy
+  inventory, physical volume, and a scaled state derivative to settle. Final element and
+  steady enthalpy balances are computed and can invalidate convergence.
+- `InitializationBranch`, `solve_branches()`, and `solve_continuation()` keep cold/unlit and
+  hot/lit solutions distinct and allow a named branch to seed the next same-topology point.
+  `NETWORK_EXTINGUISHED` remains a combustion-state diagnosis, not a lean-blowout or
+  flameholding claim.
+- `CoolingAirDestination` is now honored: primary cooling rejoins the primary/mixer zone,
+  dilution cooling enters the start of the post-flame PFR, and exit cooling enters its last
+  segment. `ReactorSpec` rejects prescribed heat-loss watts without a calibration or
+  physical-model identifier; spray sensible/latent heat carries an explicit computed basis.
+- Regression tests exercise exact PFR expansion and grid refinement, nonnegative/fixed and
+  component-wise closure, fuel-source propagation, molar mixing, inventory/residence
+  identities, cooling destinations, energy/element closure, heat-loss traceability, and
+  hot/cold continuation.
+
+Assumptions and limitations retained deliberately:
+
+- A PFR remains a numerical chain of ideal stirred cells, not a resolved velocity profile.
+  Segment refinement is required for each design-driving result.
+- Uncertainty-weighted closure does not infer uncertainty. Underdetermined data-driven
+  networks must supply it; exact template chains close uniquely after fixed recycle flows are
+  declared.
+- The control-volume reinitialization is a steady-state inventory constraint for Cantera's
+  constant-pressure zero-dimensional reactor. It is not intended to represent physical
+  transient volume forcing.
+- Hot initialization uses the equilibrium state at the aggregate inlet enthalpy. Cold
+  initialization uses the corresponding unreacted mixed state. These locate possible steady
+  branches but do not prove real flameholding or lean blowout.
+- Prescribed wall heat is now traceable but remains calibration-only. Stage 4 must replace it
+  with a wall/coolant heat-transfer closure before thermal acceptance.
+
+Implementation deviations:
+
+- The public name `minimum_norm_mass_correction()` remains for compatibility, although its
+  algorithm is no longer unconstrained minimum norm. New code should use
+  `close_internal_flows`.
+- Continuation requires identical expanded reactor names between adjacent points. A segment
+  count or topology change is rejected clearly rather than interpolating states between
+  unlike control volumes.
+
+Current verification: 70 network/template tests, 11 coupled spray/network tests, 28 design
+tests, and the focused production-PFR refinement test pass. The complete physics verification
+suite is being rerun before Stage 2 closure.

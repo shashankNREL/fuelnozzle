@@ -13,8 +13,8 @@ from fuelnozzle.crn.chemistry import (
     check_mechanism_merge,
 )
 from fuelnozzle.crn.network import CombustorNetwork
-from fuelnozzle.crn.reactors import OutletSpec, ReactorKind
-from fuelnozzle.crn.streams import AirSplit
+from fuelnozzle.crn.reactors import InletSpec, OutletSpec, ReactorKind
+from fuelnozzle.crn.streams import AirSplit, CoolingAirDestination
 from fuelnozzle.crn.templates import (
     RQL_RICH_BAND,
     ArchitectureInputs,
@@ -205,6 +205,59 @@ def test_every_architecture_ends_in_a_plug_flow_zone():
             spec for spec in architecture.reactors if spec.name == architecture.outlet_reactor
         )
         assert outlet.kind is ReactorKind.PFR
+
+
+def test_production_pfr_is_expanded_by_network_assembly():
+    network = as_network(lpp_architecture(inputs()))
+    post_segments = [
+        spec
+        for spec in network.reactors
+        if spec.name == "post_flame" or spec.name.startswith("post_flame__pfr_")
+    ]
+    assert len(post_segments) == 8
+    assert sum(spec.volume_m3 for spec in post_segments) == pytest.approx(4.0e-3)
+
+
+@pytest.mark.parametrize(
+    ("destination", "target", "at_exit"),
+    [
+        (CoolingAirDestination.PRIMARY, "lean_mixer", False),
+        (CoolingAirDestination.DILUTION, "post_flame", False),
+        (CoolingAirDestination.EXIT, "post_flame", True),
+    ],
+)
+def test_cooling_air_uses_its_declared_destination(destination, target, at_exit):
+    architecture = ldi_architecture(
+        inputs(air_split=split(cooling_destination=destination))
+    )
+    cooling = next(
+        inlet for inlet in architecture.air_inlets if inlet.name == "cooling_air"
+    )
+    assert cooling.target_reactor == target
+    assert cooling.at_reactor_exit is at_exit
+
+
+def test_fuel_addition_updates_through_flow_without_changing_recirculation():
+    architecture = ldi_architecture(inputs())
+    fuel = InletSpec(
+        name="fuel",
+        target_reactor=architecture.spray_path[0],
+        mass_flow_kg_s=0.035,
+        temperature_k=400.0,
+        mole_fractions={"POSF10325": 1.0},
+    )
+    network = CombustorNetwork(
+        architecture.reactors,
+        [*architecture.air_inlets, fuel],
+        OutletSpec(source_reactor=architecture.outlet_reactor, mass_flow_kg_s=1.035),
+        architecture.internal_flows,
+        fixed_internal_flows=architecture.fixed_internal_flows,
+    )
+    for edge in architecture.fixed_internal_flows:
+        assert network.balance.corrected_flows[edge] == pytest.approx(
+            architecture.internal_flows[edge]
+        )
+    assert all(flow >= 0.0 for flow in network.flows.values())
 
 
 # --- The idle-passage lever (plan Section 8.2.1) --------------------------------------

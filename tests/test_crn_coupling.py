@@ -113,6 +113,7 @@ def run(**overrides):
         liquid_provider(),
         settings["spray_path"],
         "POSF10325",
+        fixed_internal_flows={("flame", "mixer"), ("mixer", "evap")},
         max_iterations=12,
     )
 

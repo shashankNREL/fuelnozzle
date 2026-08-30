@@ -229,6 +229,108 @@ mechanism. An unsupported component stops with an error instead of being dropped
 dropping part of a fuel changes its heating value, stoichiometric air requirement, flame
 temperature, and emissions.
 
+\subsection{Stage 2: making the reactor graph match the stated equations}
+
+\subsubsection{A plug-flow label now creates plug flow numerically}
+
+A plug-flow region represents gas moving downstream without mixing back upstream. Cantera's
+simultaneous recirculating network cannot insert a spatial plug-flow object directly, so the
+usual approximation is a row of small stirred tanks. Material leaving tank one enters tank
+two, then tank three, and so on. More tanks reduce the artificial axial mixing.
+
+Earlier, \code{ReactorKind.PFR} stored a segment count but the solver made one large stirred
+reactor. \code{\_expand\_plug\_flow\_reactors} now constructs the chain at
+\srcline{src/fuelnozzle/crn/network.py}{392--480}. It preserves the physical zone's total
+volume and heat loss, sends normal inlets to the first segment, and takes the outlet from the
+last. \code{NetworkSolution.zone} and \code{zone\_residence\_time\_s} at
+\srcline{src/fuelnozzle/crn/network.py}{344--375} let a reader recover all segments and their
+total residence time. The production path is refined at 2, 4, and 8 segments in
+\srcline{tests/test_crn_verification.py}{207--235}. Segment convergence is a numerical check,
+not evidence that a real combustor has plug flow.
+
+\subsubsection{A flow can no longer become negative and then disappear}
+
+At steady state, mass entering every reactor must equal mass leaving it. Earlier, a
+least-squares correction could make a declared flow negative. The Cantera assembly then
+skipped that negative controller, so the graph actually solved was not the graph reported as
+balanced.
+
+\code{minimum\_norm\_mass\_correction} at
+\srcline{src/fuelnozzle/crn/network.py}{100--318} retains its old name for compatibility but
+now solves a constrained problem. Every corrected flow must be nonnegative. A fixed measured
+or prescribed recycle cannot change. When more than one correction can close the graph, each
+adjustable flow needs an uncertainty; changing a poorly known flow costs less than changing a
+well-known one. Boundary flow must balance both globally and inside every disconnected
+component. If the directed arrows cannot carry the required mass, the function stops instead
+of reversing an arrow. New code may use its clearer alias \code{close\_internal\_flows}.
+
+\code{Architecture.fixed\_internal\_flows} identifies physical recycle edges at
+\srcline{src/fuelnozzle/crn/templates.py}{71--87}. \code{DesignEvaluator.evaluate\_point} and
+\code{solve\_coupled} pass those identities into network assembly; see
+\srcline{src/fuelnozzle/crn/evaluate.py}{251--258} and
+\srcline{src/fuelnozzle/crn/coupling.py}{67--130}. Fuel vapor is therefore present before
+closure. Its mass increases the downstream through-flow without being spread arbitrarily
+around the recycle loop.
+
+\subsubsection{Moles, mass, volume, and residence time}
+
+Mole fraction answers the question ``what fraction of the molecules are this species?''
+Mass flow answers ``how many kilograms pass each second?'' They cannot be multiplied across
+different gases and added directly, because a kilogram of hydrogen contains many more
+molecules than a kilogram of carbon dioxide. \code{\_initial\_mixture} at
+\srcline{src/fuelnozzle/crn/network.py}{854--883} first divides each stream's mass flow by its
+molecular weight to obtain molar flow, then accumulates each species. It separately combines
+stream enthalpy using mass flow, which is the correct weighting for energy.
+
+Residence time is
+\[
+  \tau = \frac{m}{\dot m} = \frac{\rho V_{\mathrm{physical}}}{\dot m}.
+\]
+A Cantera constant-pressure zero-dimensional reactor naturally holds its initial mass and lets
+its volume change as it heats. That is useful for a piston but wrong for a fixed combustor
+zone. The time-marching loop in \code{CombustorNetwork.solve},
+\srcline{src/fuelnozzle/crn/network.py}{590--835}, re-imposes the declared physical volume
+and reinitializes Cantera after every steady iteration. \code{\_extract} at
+\srcline{src/fuelnozzle/crn/network.py}{925--954} reports Cantera's actual mass and volume,
+checks $m=\rho V$, and calculates residence time from actual inventory rather than from a
+different bookkeeping value. This volume reset is a numerical steady-state constraint; it
+must not be interpreted as a real transient piston motion.
+
+\subsubsection{What ``converged'' now means}
+
+A temperature that has stopped moving does not guarantee trace species or stored mass have
+settled. \code{ConvergenceReport} at
+\srcline{src/fuelnozzle/crn/network.py}{89--98} records the largest change in temperature,
+every species mass fraction, reactor mass, enthalpy inventory, physical volume, and the scaled
+state derivative. The acceptance checks are in
+\srcline{src/fuelnozzle/crn/network.py}{700--770}. After marching, the independent
+\code{\_element\_balance\_error} and \code{\_energy\_balance\_error} calculations at
+\srcline{src/fuelnozzle/crn/network.py}{956--1024} require atoms and steady-flow enthalpy to
+close. Chemical reactions rearrange atoms and release chemical energy; they do not create
+atoms or total enthalpy.
+
+Combustion equations can have both an unlit cold steady state and a burning hot steady state
+at one boundary condition. \code{InitializationBranch} at
+\srcline{src/fuelnozzle/crn/network.py}{68--74}, \code{solve\_branches} at
+\srcline{src/fuelnozzle/crn/network.py}{836--852}, and \code{solve\_continuation} at
+\srcline{src/fuelnozzle/crn/network.py}{1027--1048} preserve that distinction. Continuation
+uses one solution to seed the next point on an identical expanded topology. A hot mathematical
+branch does not by itself prove that a real flame anchors, and a cold branch does not by
+itself locate lean blowout; those require flameholding physics and rig evidence.
+
+\subsubsection{Cooling and prescribed heat}
+
+\code{\_cooling\_inlet} at
+\srcline{src/fuelnozzle/crn/templates.py}{188--211} now reads the declared destination.
+Primary cooling rejoins the primary/mixing zone, dilution cooling enters the beginning of the
+post-flame chain, and exit cooling joins its final segment. This matters because upstream air
+can affect reaction and NO formation for longer than air added at the exit.
+\code{ReactorSpec.validate\_kind\_consistency} at
+\srcline{src/fuelnozzle/crn/reactors.py}{66--88} also rejects a positive
+\code{heat\_loss\_w} without a calibration or physical-model identifier. That makes prescribed
+heat traceable, but it does not make the number predictive. A wall/coolant model and liner
+thermal data remain Stage 4 requirements.
+
 \section{Kinetic Mechanisms}
 
 \subsection{What a mechanism is}
