@@ -331,6 +331,219 @@ can affect reaction and NO formation for longer than air added at the exit.
 heat traceable, but it does not make the number predictive. A wall/coolant model and liner
 thermal data remain Stage 4 requirements.
 
+\subsection{Stage 3: following real liquid fuel from the nozzle}
+
+\subsubsection{Why the old all-vapour shortcut was not enough}
+
+The earlier design loop placed every kilogram of fuel into the first reactor as gas. That is
+quick, but a liquid droplet may spend much of the combustor heating and evaporating. Fuel still
+inside a droplet cannot burn. Treating it as gas too early can therefore predict a flame that is
+too hot, too stable, or in the wrong place.
+
+\code{DesignEvaluator} now accepts a \code{spray_model} in
+\srcline{src/fuelnozzle/crn/evaluate.py}{181--236}. The callback must return the actual
+\code{SprayBoundary} and a liquid-property provider for each mission point.
+\code{DesignEvaluator.evaluate_point}, at
+\srcline{src/fuelnozzle/crn/evaluate.py}{296--696}, checks the fuel name and total nozzle flow,
+then calls \code{solve_coupled}. If no callback is supplied, the old vapour-only calculation is
+still available for fast diagnosis, but its acceptance status stays \code{UNKNOWN}.
+
+For LNG, a pressure drop can separate the mixture into a vapour rich in light components and a
+liquid rich in heavier components. \code{ThermodynamicState} and the nozzle CFD boundary now
+carry both equilibrium phase compositions. \code{lng_spray_boundary}, at
+\srcline{src/fuelnozzle/crn/spray_source.py}{230--347}, converts names such as
+\code{Methane} into chemistry names such as \code{CH4}. The nozzle's finite-rate quality sets
+how much mass is vapour, while the retained equilibrium compositions state the available
+thermodynamic phase estimate. This distinction is reported because finite-rate fractionation
+still needs data.
+
+\subsubsection{Breakup now includes damping and is actually invoked}
+
+The Taylor analogy imagines a droplet as a tiny damped spring. Air pushes it out of shape,
+surface tension pulls it round, and viscosity damps its motion. The damped response used by
+\code{taylor_analogy_breakup}, at
+\srcline{src/fuelnozzle/crn/droplets.py}{139--238}, is
+\[
+ y(t)=y_f\left[1-e^{-\beta t}
+ \left(\cos\omega_d t+\frac{\beta}{\omega_d}\sin\omega_d t\right)\right].
+\]
+Breakup occurs when $y=1$. A bounded root solve finds the first crossing. This corrects the
+previous undamped timing. \code{\_march_droplets}, at
+\srcline{src/fuelnozzle/crn/coupling.py}{383--508}, calls this equation only when the nozzle
+boundary requests aerodynamic breakup. LNG flash breakup remains separate because it is driven
+from inside the liquid, not by air loading.
+
+\subsubsection{Mass, speed, vapour inhibition, and heat}
+
+The droplet integrator previously advanced radius and inferred remaining mass from radius
+cubed. That works only when liquid density is constant. Heating changes density, so the old
+method could make mass appear or disappear. \code{integrate_droplet}, at
+\srcline{src/fuelnozzle/crn/droplets.py}{437--581}, now advances mass directly and calculates
+radius from
+\[
+ r=\left(\frac{3m}{4\pi\rho_l(T,P)}\right)^{1/3}.
+\]
+
+It also advances droplet velocity. The drag acceleration is
+\[
+ \frac{du_d}{dt}=-\frac{3C_D\rho_g}{8\rho_l r}
+ (u_d-u_g)\left|u_d-u_g\right|,
+\]
+with the standard Schiller--Naumann drag coefficient. Local gas velocity comes from declared
+spray-path length divided by gas residence time. The final speed of one zone becomes the
+initial speed of the next.
+
+Evaporation slows when fuel vapour already surrounds a droplet. \code{\_gas_state}, at
+\srcline{src/fuelnozzle/crn/coupling.py}{511--538}, now sums the local fuel-species mass
+fractions instead of always reporting zero. Finally, the droplet ODE integrates convective heat
+itself. Multiplying one droplet's integrated heat by its number rate gives watts removed from
+the gas. This avoids rebuilding a variable-property enthalpy change from only two endpoint
+temperatures.
+
+\code{CoupledSolution}, at
+\srcline{src/fuelnozzle/crn/coupling.py}{62--73}, reports evaporated fuel, vapour injected by
+the nozzle, liquid carryover, the residual of their mass balance, and integrated droplet heat.
+Carryover is removed from gaseous exhaust flow before emission index is calculated. A closed
+software ledger is verification; high-pressure spray and wall-impingement experiments are
+still required for validation.
+
+\subsection{Stage 4: heating LNG without confusing the feed line and nozzle}
+
+LNG first travels through a pressurized feed line and only then drops through the nozzle.
+Heating and pressure loss occur along the first path. Flashing occurs during the second,
+approximately constant-enthalpy path. Using chamber pressure for the whole heating calculation
+mixes these two physical events.
+
+\code{feed_path_heat_budget}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{74--102}, checks the actual path produced by
+\code{solve_lng_feed_line}: the heat rate must equal mass flow times the outlet-minus-inlet
+enthalpy. Each feed-line station now retains quality and both phase compositions.
+
+\code{heat_sink_budget}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{105--218}, uses the target pressure-temperature state,
+the bubble enthalpy, and the dew enthalpy. A mixture boils over a temperature \emph{range}, not
+at one temperature. A target inside that glide therefore receives a quality between zero and
+one and only part of the total latent duty. \code{thermal_window}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{343--474}, evaluates heating at feed pressure, then
+separately compares the target temperature with chamber-pressure saturation.
+
+An engine cannot supply unlimited heat. \code{HeatSourceModel}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{231--274}, requires source temperature, source mass
+flow, heat capacity, exchanger effectiveness, minimum pinch temperature, and fuel-side
+pressure loss. Its available heat is the smaller of the effectiveness capacity and pinch
+capacity. Without a hardware evidence identifier, this calculation remains \code{UNKNOWN}.
+
+Inverse calculations must not hide impossible requests. \code{solve_temperature_for_duty}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{644--681}, and
+\code{fuel_temperature_for_target_superheat} raise
+\code{InfeasibleThermalTargetError} when the answer is outside the bracket or would boil
+upstream. They no longer return the nearest limit as though it were the requested answer.
+
+The idle passage matters too. \code{idle_circuit_screen}, at
+\srcline{src/fuelnozzle/crn/thermal.py}{501--617}, still checks Jet-A coking temperature and LNG
+vapour lock. It now separately requires soak duration, positive purge flow and time, and
+demonstrated restart before its transient gate can pass. A steady wall temperature alone
+cannot establish that a switched-off circuit will restart.
+
+\subsection{Stage 5: what the chemistry and operability calculations actually prove}
+
+\code{DesignEvaluator.evaluate_point} calls \code{validate_mechanism} before solving and stores
+the mechanism file and provenance in \code{PointResult}; see
+\srcline{src/fuelnozzle/crn/evaluate.py}{72--105}. A mechanism can load successfully yet still
+be outside its declared pressure or temperature domain. Separate applicability and held-out
+validation gates prevent ``the file ran'' from becoming ``the chemistry is accurate.''
+
+\code{IgnitionDelayTable}, at
+\srcline{src/fuelnozzle/crn/autoignition.py}{244--347}, now interpolates logarithmic ignition
+delay in three dimensions: inverse temperature, pressure, and equivalence ratio. It never
+extrapolates outside the table. \code{IgnitionEvidenceState}, at
+\srcline{src/fuelnozzle/crn/autoignition.py}{67--72}, distinguishes:
+\begin{itemize}
+  \item an interpolated finite ignition delay;
+  \item a censored lower bound, meaning no ignition happened before the integration stopped;
+  \item unavailable evidence, meaning the requested state is outside the table.
+\end{itemize}
+A censored lower bound can establish a safe numerical margin only when even that lower bound
+exceeds the required margin. \code{IgnitionMarker}, at
+\srcline{src/fuelnozzle/crn/autoignition.py}{75--77}, permits both a fixed temperature rise and
+the time of maximum temperature-rise rate so marker sensitivity can be measured.
+
+\code{laminar_flame_speed}, at
+\srcline{src/fuelnozzle/crn/autoignition.py}{583--607}, solves a freely propagating Cantera
+flame where supported. \code{flashback_screen}, at
+\srcline{src/fuelnozzle/crn/autoignition.py}{490--580}, compares passage velocity with an
+estimated turbulent flame speed. A safe number cannot pass acceptance without a calibration
+identifier for the actual passage.
+
+\code{continuation_lean_limit_screen}, at
+\srcline{src/fuelnozzle/crn/operability.py}{36--133}, follows the hot mathematical CRN branch
+from rich to lean and brackets where that branch becomes extinguished.
+\warningbox{This is a numerical extinction screen, not lean blowout. Real blowout also depends
+on flame anchoring, turbulence, recirculation, heat loss, and disturbances. It remains
+\code{UNKNOWN} until pressure-matched rig calibration exists.}
+Transient ignition, relight, fuel switching, and thermoacoustics likewise remain explicit
+external gates rather than invented reduced-order predictions.
+
+\subsection{Stage 6: optimizing mission quantities instead of internal-reactor spreads}
+
+Jet-A landing and take-off NOx is assembled as
+\[
+ D_p/F_{oo}=\frac{\sum_i EI_{\mathrm{NOx},i}\,\dot m_{f,i}\,t_i}
+ {F_{oo}},
+\]
+where the four terms are takeoff, climb-out, approach, and idle. The corrected
+\code{DesignResult.weighted_ei_nox} and \code{lto_emissions} are in
+\srcline{src/fuelnozzle/crn/evaluate.py}{108--174}. Fuel flow times duration is fuel mass, so
+long idle time no longer receives the same importance as a high-flow mode simply because it is
+long. Rated thrust and all four modes are required before the value may drive optimization.
+
+LNG results stay attached to each named cruise point through
+\code{lng_cruise_ei_by_point}. Blank or duplicate cruise names are rejected by
+\code{MissionProfile.from_cruise} at
+\srcline{src/fuelnozzle/crn/mission.py}{79--93}.
+
+The former ``mixing'' objective was merely the range of equivalence ratio across reactors in
+series; that mostly measures combustion progress. The former ``exit spread'' was the
+temperature range across every internal reactor; that is not an exit traverse. Both are now
+unavailable (\code{NaN}) compatibility fields and are absent from the primary objective list.
+A calibrated mixture-fraction distribution and mass-weighted parallel exit streams must be
+supplied before those ideas return as objectives.
+
+\code{evaluate_objectives}, at
+\srcline{src/fuelnozzle/crn/objectives.py}{66--193}, retains each mode and cruise metric and
+turns failed gates into constraints. \code{rank_key}, at
+\srcline{src/fuelnozzle/crn/objectives.py}{196--210}, uses a declared lexicographic preference
+only after feasibility; it no longer adds quantities with units of g/kN, g/kg, kelvin, and
+dimensionless spread. The Pareto front remains the primary result.
+
+\code{evaluate_uncertainty_ensemble}, at
+\srcline{src/fuelnozzle/crn/uncertainty.py}{68--124}, evaluates explicit input, calibration,
+mechanism, manufacturing, numerical, and model-form cases. It reports empirical objective
+intervals and passes robust feasibility only when every category is represented and every case
+passes. The software cannot supply the uncertainty distributions; those remain engineering
+inputs backed by data.
+
+\subsection{Stage 7: a report schema that says NO-GO when evidence is missing}
+
+\code{EvidenceGrade} and \code{EvidenceRecord}, at
+\srcline{src/fuelnozzle/crn/evidence.py}{14--49}, label each quantity verified, calibrated,
+validated, extrapolated, unavailable, or missing. Verification shows that software solves its
+stated equations. Validation shows, using independent data, that those equations predict
+reality in a declared range. They are not interchangeable.
+
+\code{build_conceptual_design_report}, at
+\srcline{src/fuelnozzle/crn/evidence.py}{124--255}, gathers effective areas, pressure losses,
+flows, volumes, residence times, thermal schedule, constraints, Pareto position, uncertainty,
+and review evidence. Missing dimensions or injector ranges are written as \code{None}; a
+reasonable-looking placeholder is never substituted.
+
+A release is \code{GO} only when mission acceptance passes, all required predictive evidence is
+validated, every uncertainty category is robustly feasible, and an independent technical
+review is supplied. The present disposition is \textbf{NO-GO}: the repository does not contain
+the engine cycle deck, installed geometry, nozzle/spray/thermal rig data, high-pressure
+chemistry and emissions holdouts, exit traverse, transient operability evidence, uncertainty
+inputs, or independent review needed for a dual-fuel conceptual-design recommendation.
+
 \section{Kinetic Mechanisms}
 
 \subsection{What a mechanism is}

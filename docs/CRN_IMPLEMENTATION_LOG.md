@@ -1515,7 +1515,7 @@ Deviations from the approved plan:
 
 Verification at closure: 67 focused Stage 1/chemistry/design tests passed and Ruff passed.
 
-### 10.3 Stage 2 -- topology, conservation, inventory, and steady branches (in progress)
+### 10.3 Stage 2 -- topology, conservation, inventory, and steady branches (complete)
 
 Implemented:
 
@@ -1582,6 +1582,199 @@ Implementation deviations:
   count or topology change is rejected clearly rather than interpolating states between
   unlike control volumes.
 
-Current verification: 70 network/template tests, 11 coupled spray/network tests, 28 design
-tests, and the focused production-PFR refinement test pass. The complete physics verification
-suite is being rerun before Stage 2 closure.
+Verification at closure: 82 focused network, template, coupling, and design tests passed and
+Ruff passed. The earlier long-running full physics suite was stopped under the user's time
+limit; that deviation did not waive any Stage 7 validation gate.
+
+### 10.4 Stage 3 -- conservative nozzle, phase, spray, and CRN coupling (implemented;
+external validation open)
+
+Implemented:
+
+- `DesignEvaluator` now accepts an explicit `spray_model` callback. When present,
+  `evaluate_point()` uses the returned `SprayBoundary` and liquid-property provider in
+  `solve_coupled()` rather than inserting all fuel as vapor. Fuel identity and nozzle mass
+  flow must match the mission point. Omitting the callback retains the quick gas-only
+  diagnostic, but the model-fidelity gate remains `UNKNOWN`.
+- `ThermodynamicState`, `CFDSprayBoundary`, and `SprayBoundary` preserve equilibrium liquid
+  and vapor mole fractions. The LNG nozzle bridge maps each CoolProp component to the
+  corresponding Cantera species before the phase streams enter the CRN. The finite-rate
+  quality remains the mass split; equilibrium phase compositions are identified as such.
+- `taylor_analogy_breakup()` now includes exponential viscous damping in the forced oscillator
+  and finds the first threshold crossing with a bounded root solve. `_march_droplets()` invokes
+  it only when `SprayBoundary.apply_aerodynamic_breakup` requests it. Internally driven LNG
+  flash breakup remains separate.
+- `integrate_droplet()` advances liquid mass directly, then obtains radius from current mass,
+  density, and temperature. This removes the variable-density error caused by inferring mass
+  from radius cubed. The same ODE advances droplet velocity with Schiller--Naumann drag and
+  integrates gas-to-liquid heat directly.
+- `_march_droplets()` estimates local gas velocity from declared spray-path length and gas
+  residence time, propagates droplet velocity between zones, calculates local fuel-vapor mass
+  fraction from the reactor composition, and therefore activates vapor-inhibition physics.
+  Its gas heat sink is the integrated convective heat for every droplet class, not an endpoint
+  latent/sensible reconstruction.
+- `CoupledSolution` reports the nozzle-vapor, evaporated-fuel, and liquid-carryover mass ledger,
+  its residual, and integrated droplet heat. `DesignEvaluator` adds explicit mass-closure and
+  carryover gates and uses gas exhaust flow, excluding carryover, in emission-index arithmetic.
+
+Verification:
+
+- Existing coupling and spray tests passed (28 tests), and the updated droplet, thermal, and
+  evidence-focused group passed (70 tests total). New checks verify direct liquid-mass closure,
+  drag relaxation, integrated heat, phase glide, and coupled fuel closure.
+
+Deviations and open evidence:
+
+- Real installed nozzle geometry, Jet-A sheet/air-core calibration, LNG finite-rate flash
+  calibration, high-pressure breakup data, chamber wall geometry, and impingement data were
+  not available. No values were invented. Uncalibrated size, flash, single-surrogate Jet-A
+  evaporation, dense-gas transfer, and possible wall impingement remain `UNKNOWN` for design
+  acceptance.
+- A complete multicomponent Jet-A distillation model was not added because no validated
+  composition/property basis exists in the repository. The current single-surrogate model is
+  explicitly screening-only.
+- Trajectory is one-dimensional along a declared path; transverse position and wall films
+  remain outside the model domain.
+
+### 10.5 Stage 4 -- LNG thermal management (implemented; hardware thermal evidence open)
+
+Implemented:
+
+- `feed_path_heat_budget()` checks heat against enthalpy rise on the actual segmented
+  pressure/enthalpy path produced by `solve_lng_feed_line()`. Every `FeedLinePoint` now retains
+  equilibrium liquid and vapor compositions as well as quality.
+- `heat_sink_budget()` obtains the target state from a pressure-temperature flash and divides
+  its enthalpy rise at the bubble and dew enthalpies. A multicomponent target inside the
+  temperature glide therefore has a quality between zero and one instead of being forced to
+  all-liquid or all-vapor.
+- `thermal_window()` calculates upstream heating duty at feed pressure. Chamber superheat is
+  still evaluated at chamber pressure, while the nozzle flash is correctly understood as a
+  later isenthalpic pressure drop.
+- `HeatSourceModel` bounds recoverable heat by declared source mass flow, heat capacity,
+  inlet temperature, exchanger effectiveness, minimum pinch, and fuel-side pressure loss.
+  A missing evidence identifier makes the source status `UNKNOWN`; the old scalar ceiling is
+  retained only as an unvalidated compatibility input.
+- `fuel_temperature_for_target_superheat()` and `solve_temperature_for_duty()` now raise
+  `InfeasibleThermalTargetError` when a target crosses feed saturation or lies outside the
+  inverse bracket. They no longer silently return a bracket boundary.
+- `ThermalWindowPoint` carries autoignition and heat-source statuses. A supplied
+  `autoignition_evaluator` is evaluated at every candidate temperature.
+- `idle_circuit_screen()` now distinguishes the steady wall-temperature screen from transient
+  soak, purge, and restart evidence. `DesignEvaluator` attaches this screen when wall
+  temperature is present; missing transient data remains an explicit `UNKNOWN` gate.
+
+Deviations and open evidence:
+
+- A specific aircraft/engine heat exchanger and off-design heat-rejection map were not
+  available. The code accepts the required physical inputs but cannot create a control schedule
+  or calibration from no data.
+- Deposit accumulation, actual purge volume, soak-back transient, and restart performance need
+  fuel-system geometry and rig evidence. The implemented inputs fail closed; they are not a
+  fitted coking model.
+- Equilibrium phase compositions are retained. Nonequilibrium phase fractionation inside the
+  finite-rate nozzle still requires dedicated validation.
+
+### 10.6 Stage 5 -- chemistry and operability credibility (implemented; validation gates open)
+
+Implemented:
+
+- `evaluate_point()` calls `validate_mechanism()` before a production solve and attaches
+  mechanism path and provenance to `PointResult`. Separate applicability and held-out
+  validation gates prevent a structurally loadable mechanism from being mistaken for a
+  pressure-appropriate validated one.
+- `IgnitionDelayTable.evaluate()` performs bounded interpolation in inverse temperature,
+  pressure, and equivalence ratio on logarithmic delay. `IgnitionEvidenceState` separates a
+  finite interpolated result, a no-ignition lower bound censored at the integration window, and
+  an out-of-domain/unavailable result. A censored bound proves safety only when its lower-bound
+  margin clears the requested minimum.
+- `IgnitionMarker` supports both fixed temperature rise and maximum temperature-rate timing.
+  Marker sensitivity remains evidence to report rather than a reason to choose the most
+  favorable delay.
+- `laminar_flame_speed()` provides a Cantera freely propagating flame calculation where the
+  mechanism supports it. `flashback_screen()` now requires a passage-correlation calibration
+  identifier before a numerically safe screen can pass an acceptance gate.
+- `continuation_lean_limit_screen()` follows the hot CRN branch from rich to lean, reports the
+  last lit and first extinguished points, and carries CO only as an uncalibrated diagnostic.
+  Its warnings state explicitly that numerical extinction is not physical lean blowout.
+- Lean blowout, transient ignition, relight, fuel switching, and thermoacoustics are materialized
+  as `UNKNOWN` external gates at every mission point instead of existing only in prose.
+
+Deviations and open evidence:
+
+- No new chemical mechanism or external chemistry dataset was available. GRI-Mech remains an
+  LNG baseline only; the Jet-A fast-NTC file remains one hypothetical sensitivity mechanism.
+  The missing mechanism bracket and held-out flame, ignition, and emissions validations block
+  acceptance.
+- Flame speed can be computed, but turbulent flashback correlation constants still require the
+  actual passage and rig. CRN extinction can be bracketed, but high-pressure sector calibration
+  is required before calling the result LBO.
+- Quantitative CO, UHC, soot, and nvPM claims remain unavailable. No transient or thermoacoustic
+  model was fabricated.
+
+### 10.7 Stage 6 -- mission objectives and robust feasibility (implemented; recommendation gate
+open)
+
+Implemented:
+
+- `DesignResult.weighted_ei_nox()` now weights emission index by fuel mass
+  (`fuel flow * duration`), not by time alone. `lto_emissions()` assembles every available
+  Jet-A mode with rated thrust through the existing `lto_dp_foo()` arithmetic. Missing rated
+  thrust or any of the four ICAO modes creates an objective constraint rather than a
+  certification-looking number.
+- `lng_cruise_ei_by_point()` and `ObjectiveVector.named_metrics` retain every named LNG cruise
+  result. `MissionProfile.from_cruise()` rejects blank or duplicate point names.
+- The serial-reactor equivalence-ratio range and all-reactor temperature range are no longer
+  optimizer objectives. Their compatibility fields are `NaN`. A calibrated mixture-fraction
+  PDF/unmixedness input and a mass-weighted parallel exit traverse remain unavailable, so the
+  optimizer is not allowed to minimize misleading proxies.
+- Every explicit failed point gate becomes a constraint. The primary objective set is Jet-A
+  four-mode Dp/Foo and named-cruise LNG NOx. `rank_key()` uses the caller's declared
+  lexicographic preference only as a tie breaker and does not sum incompatible units; the
+  Pareto front remains primary.
+- `cost_of_shared_liner()` identifies a one-coordinate sweep, sorts samples by that physical
+  coordinate, and checks endpoints there. It no longer mistakes random insertion order for a
+  swept range.
+- `evaluate_uncertainty_ensemble()` accepts explicit input, calibration, mechanism,
+  manufacturing, numerical, and model-form cases, returns empirical objective intervals, and
+  reports robust `PASS` only when every category is covered and every case is feasible.
+
+Deviations and open evidence:
+
+- The code provides uncertainty propagation, not uncertainty values. Required distributions,
+  correlations, mechanism alternatives, manufacturing tolerances, and model-form cases must
+  come from data and engineering ownership.
+- Adaptive range expansion was not made automatic because changing hardware bounds without an
+  approved design envelope can be unsafe. An unbracketed optimum is reported and the caller
+  must authorize expanded bounds.
+- No calibrated unmixedness model, exit traverse, combustion-efficiency model, liner thermal
+  limit, or validated pressure-loss closure was available. Their gates remain open rather than
+  being replaced by CRN-internal spreads.
+
+### 10.8 Stage 7 -- evidence-graded conceptual release (implemented; disposition NO-GO)
+
+Implemented:
+
+- `EvidenceGrade` and `EvidenceRecord` distinguish verified software, calibrated inputs,
+  held-out validation, extrapolation, unavailable evidence, and missing calculations.
+  Verification or calibration alone does not pass a predictive validation gate.
+- `build_conceptual_design_report()` returns one schema for dimensions, effective areas,
+  pressure loss, mission flows, volumes, residence times, injector ranges, thermal schedule,
+  constraint gates, Pareto position, uncertainty status, evidence, and independent review.
+  Missing geometry and ranges are represented by `None`, never a plausible placeholder.
+- A release is `GO` only if mission acceptance, every required validation record, all
+  uncertainty categories, and independent technical review pass. `UNKNOWN` is operationally
+  `NO_GO`.
+
+Current release disposition:
+
+- **NO-GO.** The repository lacks the engine cycle deck, installed dimensions/effective-area
+  calibration, nozzle and spray rig data, representative high-pressure LNG/Jet-A chemistry and
+  emissions holdouts, exit traverse and liner thermal evidence, transient fuel-switch/relight
+  evidence, uncertainty inputs, and independent technical review required by Stages 3--7.
+- The implemented code makes these absences visible and machine-readable. It does not satisfy
+  the external exit gates merely by having software paths for them.
+
+Stage 3--7 focused verification at implementation time: Ruff passed and 70 focused droplet,
+thermal, objective, uncertainty, and release tests passed. Additional existing coupling/spray
+tests passed (28 tests). Full-suite validation and security checks are recorded below when
+completed.
