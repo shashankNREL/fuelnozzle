@@ -83,17 +83,77 @@ The companion documents are:
 \end{itemize}
 
 \section{How to Read This Report}
-\emph{Pending.} Will follow the structure of the nozzle technical reference: separating
-what is a physical law, what is a numerical approximation, what is an empirical
-calibration, and what is simply unmodeled.
+
+Each section separates four different kinds of statement. A \emph{physical law} is a
+conservation rule, such as mass entering a steady reactor equalling mass leaving it. A
+\emph{numerical approximation} is how the computer solves that law, such as replacing a
+long tube by several small stirred tanks. A \emph{calibration} is a number fitted to data.
+An \emph{unmodeled effect} is deliberately absent. Keeping these labels separate prevents a
+software test from being mistaken for proof that a model represents real hardware.
+
+Source references use a file and line range, for example
+\srcline{src/fuelnozzle/crn/autoignition.py}{56--63}. Function names are included so a
+reader can search the source even when later edits move a line.
 
 \section{Basic Vocabulary for a New Reader}
-\emph{Pending.} Reactors, residence time, equivalence ratio, ignition delay, emission
-index, and the difference between a reactor network and a computational fluid dynamics
-simulation.
+
+A \emph{reactor} is a simplified region in which the gas is represented by one average
+temperature and composition. A \emph{reactor network} connects several such regions with
+mass flows. Residence time means how long material remains in a region on average.
+Equivalence ratio compares the actual fuel-to-air ratio with the amount needed for complete
+combustion: one is stoichiometric, below one is lean, and above one is rich. Ignition delay
+is the time between preparing a mixture and its rapid self-heating. An emission index is
+grams of pollutant per kilogram of fuel.
+
+A reactor network does not resolve three-dimensional jets, wakes, droplets, or wall films
+the way computational fluid dynamics can. It is fast because those details are represented
+by a few zones and calibrated connections. Its answers are only as physical as those zones,
+flows, and calibrations.
 
 \section{Why a Reactor Network, and What It Cannot Do}
-\emph{Pending.}
+
+The network is useful for screening many candidate designs before expensive CFD and rig
+tests. It can conserve species, integrate finite-rate chemistry, and expose how residence
+time or air staging changes a trend. It cannot discover a liner geometry, mixing pattern,
+flame attachment, thermoacoustic mode, or spray-wall interaction without additional models
+and evidence. The current design evaluator is therefore a prototype screening path, as
+stated in \srcline{src/fuelnozzle/crn/evaluate.py}{1--14}.
+
+\section{Plain-English Implementation Change Log}
+
+\subsection{Stage 0: an unavailable safety calculation is not safe}
+
+Earlier versions used the Python value \code{None} both when an ignition calculation did
+not produce a delay and when the requested condition was outside the table. They then called
+that result safe. A novice can think of this as a thermometer displaying nothing and the
+software interpreting the blank display as ``not hot.'' A blank display does not establish
+that.
+
+\code{AutoignitionVerdict} now includes \code{UNKNOWN} at
+\srcline{src/fuelnozzle/crn/autoignition.py}{56--63}. The function
+\code{autoignition_margin} returns that verdict and an error when no delay is available at
+\srcline{src/fuelnozzle/crn/autoignition.py}{302--323}. The optimizer-facing function
+\code{evaluate_objectives} converts the unknown state into a constraint violation at
+\srcline{src/fuelnozzle/crn/objectives.py}{87--119}. This does not claim the passage has
+failed physically. It means the tool lacks enough evidence to accept it.
+
+The more general implementation is \code{GateStatus}, \code{GateResult}, and
+\code{aggregate_gate_status} in
+\srcline{src/fuelnozzle/crn/status.py}{1--32}. A failed gate dominates an unknown gate, and
+an unknown gate prevents a pass. \code{PointResult} and \code{DesignResult} expose separate
+computational and acceptance states in
+\srcline{src/fuelnozzle/crn/evaluate.py}{60--115}. Thus a numerical solver may finish
+successfully while the design remains unknown because spray fidelity or validation evidence
+is absent. The old \code{feasible} name remains as a compatibility property, but it is true
+only for an acceptance pass.
+
+The module-level explanation in \code{evaluate.py} and the printed example were also
+changed to call the current all-vapour calculations diagnostics rather than validated
+design answers. The test
+\code{test_unavailable_ignition_delay_is_unknown_and_fail_closed} in
+\srcline{tests/test_crn_autoignition_thermal.py}{268--290} guards this behavior. The
+equation and evidence status for every design-driving model is tracked in
+\code{docs/CRN_EQUATION_REGISTER.md}.
 
 \section{Kinetic Mechanisms}
 

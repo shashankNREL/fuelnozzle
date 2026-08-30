@@ -195,22 +195,22 @@ def answer_one(reg):
         if best is None or emissions.ei_nox_g_per_kg < best[1]:
             best = (dome, emissions.ei_nox_g_per_kg, phi)
 
-    print(f"\n  Minimum NOx at f_dome = {best[0]:.2f}, phi_rich = {best[2]:.2f}")
+    print(f"\n  Lowest diagnostic NOx at f_dome = {best[0]:.2f}, phi_rich = {best[2]:.2f}")
     print("\n  Sanity anchor: classical RQL practice puts the optimum near phi_rich")
     print("  1.4-1.6. The minimum here sits just below that band and is sharply peaked,")
-    print("  so the anchor is met. Reaching it required a realistic quench: an earlier")
+    print("  so this prototype reproduces the qualitative anchor. This is not validation.")
     print("  default gave a 4.6 ms quench, which flattened the curve and drifted the")
     print("  optimum to 1.22. Quench speed dominates an RQL NOx prediction.")
     print("\n  Remaining caveat: absolute EI_NOx is still roughly twice what real RQL")
     print("  hardware achieves. These zones are adiabatic and a perfectly stirred quench")
-    print("  still mixes more slowly than real jets. Trust the trend and the optimum's")
-    print("  location; do not quote the level.")
+    print("  still mixes more slowly than real jets. Treat the trend and location as")
+    print("  diagnostics until they pass the documented validation gates.")
 
 
 def answer_two(reg):
     """How lean LNG can run at cruise."""
     print("\n" + "=" * 78)
-    print("ANSWER 2  Lean limit for LNG at cruise")
+    print("DIAGNOSTIC 2  LNG cruise equivalence-ratio sweep")
     print("=" * 78)
     afr = stoichiometric_air_fuel_ratio(
         reg.template(FuelKind.LNG, MechanismRole.NETWORK),

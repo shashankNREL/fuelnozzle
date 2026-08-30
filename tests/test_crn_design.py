@@ -31,6 +31,7 @@ from fuelnozzle.crn.objectives import (
     rank_key,
 )
 from fuelnozzle.crn.optimize import DEFAULT_ORDER
+from fuelnozzle.crn.status import GateResult, GateStatus, aggregate_gate_status
 from fuelnozzle.models import WarningSeverity
 
 # --- Design variables ------------------------------------------------------------------
@@ -157,6 +158,25 @@ def test_mission_point_scales_fuel_flow():
     point = MissionPoint("takeoff", FuelKind.JET_A, 0.035, 1.0, 800.0, 2.0e6)
     assert point.scaled(2.0).fuel_mass_flow_kg_s == pytest.approx(0.070)
     assert point.scaled(2.0).air_mass_flow_kg_s == pytest.approx(1.0)
+
+
+def test_acceptance_gate_aggregation_fails_closed():
+    assert aggregate_gate_status([]) is GateStatus.UNKNOWN
+    assert aggregate_gate_status(
+        [GateResult("physics", GateStatus.PASS, "verified")]
+    ) is GateStatus.PASS
+    assert aggregate_gate_status(
+        [
+            GateResult("physics", GateStatus.PASS, "verified"),
+            GateResult("validation", GateStatus.UNKNOWN, "no holdout"),
+        ]
+    ) is GateStatus.UNKNOWN
+    assert aggregate_gate_status(
+        [
+            GateResult("validation", GateStatus.UNKNOWN, "no holdout"),
+            GateResult("safety", GateStatus.FAIL, "unsafe"),
+        ]
+    ) is GateStatus.FAIL
 
 
 # --- Objectives and ranking -------------------------------------------------------------

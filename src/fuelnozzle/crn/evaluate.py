@@ -1,4 +1,4 @@
-"""Evaluate one design across a mission set.
+"""Prototype screening evaluation of one design across a mission set.
 
 This is the inner loop of every sweep and every search, so it has to be both correct and
 quick. Two choices make it quick.
@@ -6,12 +6,10 @@ quick. Two choices make it quick.
 Mechanism objects and ignition-delay tables are cached across evaluations, because
 building them dominates the cost of a single point and none of them depend on the design.
 
-Fuel is introduced prevaporized rather than through the full droplet coupling. That is a
-real approximation and it is stated: evaporation completes upstream of the quench in the
-cases studied, and the prevaporized path was measured to reproduce the fully coupled
-solution to 2.7% while running about five times faster. Atomization-quality outputs are
-therefore **not** available from this path, and are reported separately by the droplet
-models when a spray calibration exists.
+Fuel is introduced prevaporized rather than through the full droplet coupling. This mode is
+for diagnostics and screening only: agreement in temperature does not establish agreement
+in NOx, mixing, atomization, or operability. A result from this evaluator is therefore not a
+validated conceptual design.
 """
 
 from __future__ import annotations
@@ -38,6 +36,7 @@ from fuelnozzle.crn.chemistry import (
 from fuelnozzle.crn.design import DesignVector, MissionPoint
 from fuelnozzle.crn.network import CombustorNetwork, NetworkError
 from fuelnozzle.crn.reactors import InletSpec, OutletSpec
+from fuelnozzle.crn.status import GateResult, GateStatus, aggregate_gate_status
 from fuelnozzle.crn.templates import (
     Architecture,
     ArchitectureInputs,
@@ -61,11 +60,10 @@ ARCHITECTURES = {
 
 @dataclass(frozen=True)
 class PointResult:
-    """What one design does at one mission point."""
+    """Prototype screening result at one mission point."""
 
     point: MissionPoint
     architecture: str
-    feasible: bool
     exit_temperature_k: float
     peak_temperature_k: float
     ei_nox_g_per_kg: float
@@ -75,6 +73,14 @@ class PointResult:
     quench_residence_time_s: float
     autoignition: AutoignitionMargin | None
     warnings: tuple[ModelWarning, ...]
+    computational_status: GateStatus
+    acceptance_status: GateStatus
+    gates: tuple[GateResult, ...]
+
+    @property
+    def feasible(self) -> bool:
+        """Compatibility view: only an accepted result is feasible."""
+        return self.acceptance_status is GateStatus.PASS
 
     @property
     def is_extinguished(self) -> bool:
@@ -85,12 +91,19 @@ class PointResult:
 
 @dataclass(frozen=True)
 class DesignResult:
-    """What one design does across the whole mission."""
+    """Prototype screening result across the whole mission."""
 
     design: DesignVector
     points: tuple[PointResult, ...]
-    feasible: bool
     warnings: tuple[ModelWarning, ...]
+    computational_status: GateStatus
+    acceptance_status: GateStatus
+    gates: tuple[GateResult, ...]
+
+    @property
+    def feasible(self) -> bool:
+        """Compatibility view: only an accepted design is feasible."""
+        return self.acceptance_status is GateStatus.PASS
 
     def by_fuel(self, fuel: FuelKind) -> tuple[PointResult, ...]:
         return tuple(result for result in self.points if result.point.fuel is fuel)
@@ -109,7 +122,7 @@ class DesignResult:
 
 
 class DesignEvaluator:
-    """Evaluates designs against a fixed mission set and mechanism registry."""
+    """Runs a prototype, prevaporized screening model over a fixed mission set."""
 
     def __init__(
         self,
@@ -205,13 +218,23 @@ class DesignEvaluator:
                 )
             )
             return PointResult(
-                point=point, architecture=self.architecture_for(point.fuel), feasible=False,
+                point=point, architecture=self.architecture_for(point.fuel),
                 exit_temperature_k=float("nan"), peak_temperature_k=float("nan"),
                 ei_nox_g_per_kg=float("inf"), equivalence_ratio_spread=float("nan"),
                 near_field_equivalence_ratio=architecture.near_field_equivalence_ratio,
                 exit_temperature_spread_k=float("nan"),
                 quench_residence_time_s=float("nan"), autoignition=None,
                 warnings=tuple(warnings),
+                computational_status=GateStatus.FAIL,
+                acceptance_status=GateStatus.FAIL,
+                gates=(
+                    GateResult(
+                        name="network_solve",
+                        status=GateStatus.FAIL,
+                        reason=str(error),
+                        evidence="CombustorNetwork.solve",
+                    ),
+                ),
             )
 
         warnings.extend(solution.warnings)
@@ -240,14 +263,54 @@ class DesignEvaluator:
         if ignition is not None:
             warnings.extend(ignition.warnings)
 
-        feasible = (
+        computational_status = (
+            GateStatus.PASS
+            if (
             not any(w.severity is WarningSeverity.ERROR for w in warnings)
             and solution.converged
+            )
+            else GateStatus.FAIL
         )
+        gates = [
+            GateResult(
+                name="network_solve",
+                status=computational_status,
+                reason=(
+                    "network converged without an error"
+                    if computational_status is GateStatus.PASS
+                    else "network did not converge or emitted an error"
+                ),
+                evidence="CombustorNetwork.solve",
+            ),
+            GateResult(
+                name="model_fidelity",
+                status=GateStatus.UNKNOWN,
+                reason=(
+                    "the prototype evaluator uses prevaporized fuel and has no "
+                    "experimental validation for design acceptance"
+                ),
+                evidence="docs/CRN_EQUATION_REGISTER.md",
+            ),
+        ]
+        if ignition is not None and ignition.verdict is not AutoignitionVerdict.NO_PREMIXER:
+            ignition_status = {
+                AutoignitionVerdict.SAFE: GateStatus.PASS,
+                AutoignitionVerdict.MARGINAL: GateStatus.FAIL,
+                AutoignitionVerdict.UNSAFE: GateStatus.FAIL,
+                AutoignitionVerdict.UNKNOWN: GateStatus.UNKNOWN,
+            }[ignition.verdict]
+            gates.append(
+                GateResult(
+                    name="autoignition",
+                    status=ignition_status,
+                    reason=f"autoignition verdict is {ignition.verdict.value}",
+                    evidence=ignition.mechanism_path,
+                )
+            )
+        acceptance_status = aggregate_gate_status(gates)
         return PointResult(
             point=point,
             architecture=self.architecture_for(point.fuel),
-            feasible=feasible,
             exit_temperature_k=outlet.temperature_k,
             peak_temperature_k=solution.peak_temperature_k,
             ei_nox_g_per_kg=ei_nox,
@@ -257,6 +320,9 @@ class DesignEvaluator:
             quench_residence_time_s=quench_residence_time_s(solution),
             autoignition=ignition,
             warnings=tuple(warnings),
+            computational_status=computational_status,
+            acceptance_status=acceptance_status,
+            gates=tuple(gates),
         )
 
     def _autoignition(
@@ -297,9 +363,27 @@ class DesignEvaluator:
         warnings = tuple(
             warning for result in results for warning in result.warnings
         )
+        computational_gates = tuple(
+            GateResult(
+                name=f"{result.point.name}:computation",
+                status=result.computational_status,
+                reason="mission-point computational status",
+            )
+            for result in results
+        )
+        acceptance_gates = tuple(
+            GateResult(
+                name=f"{result.point.name}:acceptance",
+                status=result.acceptance_status,
+                reason="mission-point acceptance status",
+            )
+            for result in results
+        )
         return DesignResult(
             design=design,
             points=results,
-            feasible=all(result.feasible for result in results),
             warnings=warnings,
+            computational_status=aggregate_gate_status(computational_gates),
+            acceptance_status=aggregate_gate_status(acceptance_gates),
+            gates=acceptance_gates,
         )

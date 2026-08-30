@@ -265,6 +265,26 @@ def test_margin_rejects_a_nonpositive_residence_time():
         jet_a_margin(0.0)
 
 
+def test_unavailable_ignition_delay_is_unknown_and_fail_closed():
+    reg = registry()
+    spec = reg.spec_for(FuelKind.JET_A, MechanismRole.NETWORK)
+    state = premix_state(
+        reg.new_solution(FuelKind.JET_A, MechanismRole.NETWORK),
+        spec,
+        air_mass_flow_kg_s=1.0,
+        air_temperature_k=1200.0,
+        fuel_mass_flow_kg_s=0.035,
+        fuel_temperature_k=470.0,
+        pressure_pa=PRESSURE_PA,
+    )
+    table = IgnitionDelayTable(
+        reg, FuelKind.JET_A, (700.0, 800.0), (PRESSURE_PA,), (0.5,)
+    )
+    result = autoignition_margin(table, state, 1.0e-3, FuelKind.JET_A)
+    assert result.verdict is AutoignitionVerdict.UNKNOWN
+    assert any(warning.severity is WarningSeverity.ERROR for warning in result.warnings)
+
+
 # --- Flashback -------------------------------------------------------------------------
 
 

@@ -17,6 +17,7 @@ from enum import StrEnum
 from fuelnozzle.crn.autoignition import AutoignitionVerdict
 from fuelnozzle.crn.chemistry import FuelKind
 from fuelnozzle.crn.evaluate import DesignResult
+from fuelnozzle.crn.status import GateStatus
 from fuelnozzle.models import WarningSeverity
 
 
@@ -63,7 +64,7 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
 
     for point in result.points:
         label = point.point.name
-        if not point.feasible:
+        if point.computational_status is GateStatus.FAIL:
             errors = [
                 warning.message
                 for warning in point.warnings
@@ -76,6 +77,14 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
                     detail=errors[0] if errors else "point did not solve",
                 )
             )
+        elif point.acceptance_status is GateStatus.UNKNOWN:
+            violations.append(
+                ConstraintViolation(
+                    name=f"{label}:acceptance_unknown",
+                    amount=1.0,
+                    detail="required model fidelity or validation evidence is unavailable",
+                )
+            )
         if point.is_extinguished:
             violations.append(
                 ConstraintViolation(
@@ -85,8 +94,16 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
                 )
             )
         margin = point.autoignition
-        if margin is not None and margin.margin is not None:
-            if margin.verdict is AutoignitionVerdict.UNSAFE:
+        if margin is not None:
+            if margin.verdict is AutoignitionVerdict.UNKNOWN:
+                violations.append(
+                    ConstraintViolation(
+                        name=f"{label}:autoignition_unknown",
+                        amount=1.0,
+                        detail="autoignition safety could not be established",
+                    )
+                )
+            elif margin.margin is not None and margin.verdict is AutoignitionVerdict.UNSAFE:
                 violations.append(
                     ConstraintViolation(
                         name=f"{label}:autoignition",
@@ -97,7 +114,7 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
                         ),
                     )
                 )
-            elif margin.verdict is AutoignitionVerdict.MARGINAL:
+            elif margin.margin is not None and margin.verdict is AutoignitionVerdict.MARGINAL:
                 violations.append(
                     ConstraintViolation(
                         name=f"{label}:autoignition_margin",

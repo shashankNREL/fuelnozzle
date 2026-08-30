@@ -59,6 +59,7 @@ class AutoignitionVerdict(StrEnum):
     SAFE = "safe"
     MARGINAL = "marginal"
     UNSAFE = "unsafe"
+    UNKNOWN = "unknown"
     NO_PREMIXER = "no_premixing_passage"
 
 
@@ -303,17 +304,19 @@ def autoignition_margin(
         warnings.append(
             ModelWarning(
                 code="IGNITION_DELAY_UNAVAILABLE",
-                severity=WarningSeverity.INFO,
+                severity=WarningSeverity.ERROR,
                 message=(
                     "The mixture did not ignite within the tabulated window, or the "
-                    "condition lies outside the table. No margin is reported."
+                    "condition lies outside the table. These cases cannot be distinguished "
+                    "by this table, so the safety state is unknown and the design is not "
+                    "eligible for acceptance."
                 ),
             )
         )
         return AutoignitionMargin(
             fuel=fuel, premix=premix, ignition_delay_s=None,
             residence_time_s=residence_time_s, margin=None,
-            minimum_margin=minimum_margin, verdict=AutoignitionVerdict.SAFE,
+            minimum_margin=minimum_margin, verdict=AutoignitionVerdict.UNKNOWN,
             mechanism_path=table.spec.path,
             used_dedicated_ignition_mechanism=table.uses_dedicated_mechanism,
             warnings=tuple(warnings),

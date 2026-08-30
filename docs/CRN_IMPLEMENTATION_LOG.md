@@ -1421,3 +1421,37 @@ thermal, chemistry, and operability evaluator. Optimization in Stage 6 should no
 select hardware until the relevant Section 8 component and subsystem gates pass.
 
 **No source implementation should begin until this audit and staged plan are approved.**
+
+---
+
+## 10. Approved remediation implementation log (started 2026-08-30)
+
+The user approved Stages 0--2 followed by the remaining stages. This section is the running
+record of implementation details, verification, and deviations. Entries are appended as work
+is completed; a stage is not complete merely because code exists.
+
+### 10.1 Stage 0 -- fail-closed screening status (in progress)
+
+Implemented so far:
+
+- `AutoignitionVerdict.UNKNOWN` distinguishes an unavailable ignition calculation from a
+  safe one. `autoignition_margin()` now emits an error and makes the design ineligible for
+  acceptance when the table cannot supply a delay.
+- `evaluate_objectives()` creates an explicit constraint violation for unknown
+  autoignition. The prototype evaluator and example now call their outputs screening
+  diagnostics rather than validated design answers.
+- `crn/status.py` provides general `PASS`, `FAIL`, and `UNKNOWN` gates. `PointResult` and
+  `DesignResult` now report computational and acceptance status separately. The legacy
+  `feasible` property is true only for acceptance `PASS`; the current prevaporized prototype
+  remains `UNKNOWN` even after a successful numerical solve.
+- `docs/CRN_EQUATION_REGISTER.md` records each design-driving relation, its implementation,
+  applicability, verification, validation evidence, and current acceptance status.
+- A regression test exercises an above-table ignition state and requires fail-closed
+  behavior.
+
+Deviations and constraints:
+
+- Evidence grades and the external release gate remain in Stage 7; the general tri-state
+  acceptance mechanism itself is now implemented.
+- “Unknown” is not treated as physical failure. It is a distinct state that is ineligible
+  for design acceptance until evidence resolves it.
