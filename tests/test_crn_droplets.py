@@ -302,7 +302,7 @@ def test_heat_transfer_scaling_is_linear_in_the_boiling_branch():
 def _time_to_one_tenth_diameter(gas_temperature_k: float) -> float:
     provider = JetALiquidProvider(jet_a_table())
     history = integrate_droplet(
-        air(gas_temperature_k), provider, 75.0e-6, 300.0, 112.0, residence_time_s=5.0
+        air(gas_temperature_k), provider, 75.0e-6, 300.0, 112.0, residence_time_s=10.0
     )
     radii = np.array(history.radius_m)
     times = np.array(history.time_s)
@@ -362,6 +362,18 @@ def test_partial_evaporation_reports_a_fraction_between_zero_and_one():
     )
     assert not history.fully_evaporated
     assert 0.0 < history.evaporated_mass_fraction < 1.0
+
+
+def test_drag_relaxes_droplet_velocity_and_direct_mass_state_closes():
+    provider = constant_liquid()
+    history = integrate_droplet(
+        air(700.0), provider, 50.0e-6, 350.0, 80.0, residence_time_s=1.0e-3
+    )
+    assert abs(history.final_velocity_m_s) < 80.0
+    assert history.evaporated_mass_fraction == pytest.approx(
+        1.0 - history.final_mass_kg / history.mass_kg[0]
+    )
+    assert history.heat_drawn_from_gas_j > 0.0
 
 
 def test_integration_rejects_nonpositive_inputs():

@@ -32,6 +32,7 @@ from typing import Protocol
 
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
 
 # Taylor analogy breakup coefficients (O'Rourke and Amsden).
 TAB_CK = 8.0
@@ -98,6 +99,7 @@ class GasState:
     specific_heat_j_kg_k: float
     mean_molecular_weight_kg_mol: float
     fuel_vapor_mass_fraction: float = 0.0
+    velocity_m_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -174,21 +176,52 @@ def taylor_analogy_breakup(
             # Viscosity overdamps the oscillation; the droplet cannot break this way.
             break
         omega = sqrt(omega_squared)
+        damping = (
+            TAB_CD
+            * liquid.viscosity_pa_s
+            / (2.0 * liquid.density_kg_m3 * current**2)
+        )
 
         local_weber = gas_weber_number(gas, liquid, current, relative_velocity_m_s)
         forced_distortion = TAB_CF * local_weber / (TAB_CK * TAB_CB)
 
-        # Starting each stage from an undistorted, motionless droplet gives amplitude
-        # equal to the forced distortion, so the peak distortion is twice it.
-        peak_distortion = 2.0 * forced_distortion
+        # The homogeneous response decays exponentially. Omitting this damping term makes
+        # viscous droplets break too early even when the natural frequency is corrected.
+        first_peak_time = pi / omega
+        peak_distortion = forced_distortion * (
+            1.0 + np.exp(-damping * first_peak_time)
+        )
         if peak_distortion <= TAB_BREAKUP_DISTORTION:
             break
 
-        # y(t) = We_c (1 - cos(omega t)) reaches 1 at this phase.
-        cos_phase = 1.0 - TAB_BREAKUP_DISTORTION / forced_distortion
-        phase = float(np.arccos(np.clip(cos_phase, -1.0, 1.0)))
-        stage_time = phase / omega
-        distortion_rate = forced_distortion * omega * float(np.sin(phase))
+        damping_ratio = damping / omega
+
+        def distortion(
+            time_s: float,
+            frequency: float = omega,
+            forcing: float = forced_distortion,
+            decay: float = damping,
+            ratio: float = damping_ratio,
+        ) -> float:
+            phase = frequency * time_s
+            return forcing * (
+                1.0
+                - np.exp(-decay * time_s)
+                * (np.cos(phase) + ratio * np.sin(phase))
+            )
+
+        stage_time = brentq(
+            lambda time_s: distortion(time_s) - TAB_BREAKUP_DISTORTION,
+            0.0,
+            first_peak_time,
+        )
+        phase = omega * stage_time
+        distortion_rate = (
+            forced_distortion
+            * np.exp(-damping * stage_time)
+            * (omega + damping**2 / omega)
+            * float(np.sin(phase))
+        )
 
         child = _post_breakup_radius(current, liquid, distortion_rate)
         if not (0.0 < child < current):
@@ -388,9 +421,14 @@ class DropletHistory:
 
     time_s: tuple[float, ...]
     radius_m: tuple[float, ...]
+    mass_kg: tuple[float, ...]
     temperature_k: tuple[float, ...]
+    velocity_m_s: tuple[float, ...]
     final_radius_m: float
+    final_mass_kg: float
     final_temperature_k: float
+    final_velocity_m_s: float
+    heat_drawn_from_gas_j: float
     evaporated_mass_fraction: float
     fully_evaporated: bool
     final_regime: EvaporationRegime
@@ -419,17 +457,55 @@ def integrate_droplet(
     if residence_time_s <= 0.0:
         raise ValueError("Residence time must be positive")
 
+    initial_liquid = provider.liquid_state(initial_temperature_k, gas.pressure_pa)
+    initial_mass = (
+        (4.0 / 3.0) * pi * initial_radius_m**3 * initial_liquid.density_kg_m3
+    )
+
+    def radius_from_mass(mass_kg: float, temperature_k: float) -> float:
+        if mass_kg <= 0.0:
+            return 0.0
+        density = provider.liquid_state(temperature_k, gas.pressure_pa).density_kg_m3
+        return (3.0 * mass_kg / (4.0 * pi * density)) ** (1.0 / 3.0)
+
     def derivatives(_t: float, state: np.ndarray) -> list[float]:
-        radius, temperature = float(state[0]), float(state[1])
-        if radius <= 0.0:
-            return [0.0, 0.0]
+        mass, temperature, velocity, _heat = map(float, state)
+        radius = radius_from_mass(mass, temperature)
+        if radius <= 0.0 or mass <= 0.0:
+            return [0.0, 0.0, 0.0, 0.0]
+        slip = velocity - gas.velocity_m_s
         rates = droplet_rates(
-            gas, provider, radius, temperature, relative_velocity_m_s, heat_transfer_scaling
+            gas, provider, radius, temperature, abs(slip), heat_transfer_scaling
         )
-        return [rates.radius_rate_m_s, rates.temperature_rate_k_s]
+        liquid = provider.liquid_state(temperature, gas.pressure_pa)
+        reynolds = (
+            2.0 * gas.density_kg_m3 * abs(slip) * radius / gas.viscosity_pa_s
+            if gas.viscosity_pa_s > 0.0
+            else 0.0
+        )
+        drag_coefficient = (
+            24.0 / max(reynolds, 1.0e-12)
+            * (1.0 + 0.15 * reynolds**0.687)
+            if reynolds < 1000.0
+            else 0.44
+        )
+        acceleration = (
+            -3.0
+            * drag_coefficient
+            * gas.density_kg_m3
+            * slip
+            * abs(slip)
+            / (8.0 * liquid.density_kg_m3 * radius)
+        )
+        return [
+            rates.mass_rate_kg_s,
+            rates.temperature_rate_k_s,
+            acceleration,
+            rates.convective_heat_w,
+        ]
 
     def fully_evaporated(_t: float, state: np.ndarray) -> float:
-        return float(state[0]) - 1.0e-9
+        return float(state[0]) - 1.0e-9 * initial_mass
 
     fully_evaporated.terminal = True
     fully_evaporated.direction = -1.0
@@ -437,7 +513,7 @@ def integrate_droplet(
     solution = solve_ivp(
         derivatives,
         (0.0, residence_time_s),
-        [initial_radius_m, initial_temperature_k],
+        [initial_mass, initial_temperature_k, relative_velocity_m_s, 0.0],
         method="LSODA",
         events=fully_evaporated,
         rtol=rtol,
@@ -447,26 +523,39 @@ def integrate_droplet(
     if not solution.success:  # pragma: no cover - solver failure path
         raise RuntimeError(f"Droplet integration failed: {solution.message}")
 
-    radii = np.maximum(solution.y[0], 0.0)
+    masses = np.maximum(solution.y[0], 0.0)
     temperatures = solution.y[1]
+    velocities = solution.y[2]
+    radii = np.array(
+        [
+            radius_from_mass(float(mass), float(temperature))
+            for mass, temperature in zip(masses, temperatures, strict=True)
+        ]
+    )
     final_radius = float(radii[-1])
-    volume_fraction_left = (final_radius / initial_radius_m) ** 3
+    final_mass = float(masses[-1])
+    mass_fraction_left = final_mass / initial_mass
     final_rates = droplet_rates(
         gas,
         provider,
         max(final_radius, 1.0e-12),
         float(temperatures[-1]),
-        relative_velocity_m_s,
+        abs(float(velocities[-1]) - gas.velocity_m_s),
         heat_transfer_scaling,
     )
 
     return DropletHistory(
         time_s=tuple(float(value) for value in solution.t),
         radius_m=tuple(float(value) for value in radii),
+        mass_kg=tuple(float(value) for value in masses),
         temperature_k=tuple(float(value) for value in temperatures),
+        velocity_m_s=tuple(float(value) for value in velocities),
         final_radius_m=final_radius,
+        final_mass_kg=final_mass,
         final_temperature_k=float(temperatures[-1]),
-        evaporated_mass_fraction=float(min(1.0, max(0.0, 1.0 - volume_fraction_left))),
+        final_velocity_m_s=float(velocities[-1]),
+        heat_drawn_from_gas_j=float(max(solution.y[3, -1], 0.0)),
+        evaporated_mass_fraction=float(min(1.0, max(0.0, 1.0 - mass_fraction_left))),
         fully_evaporated=bool(solution.status == 1 or final_radius <= 1.0e-9),
         final_regime=final_rates.regime,
     )

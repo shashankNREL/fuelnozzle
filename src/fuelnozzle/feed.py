@@ -46,6 +46,8 @@ class FeedLinePoint:
     enthalpy_j_kg: float
     vapor_quality_mass: float
     heat_leak_w_per_m: float
+    liquid_mole_fractions: dict[str, float] | None = None
+    vapor_mole_fractions: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,8 @@ def solve_lng_feed_line(
                 enthalpy_j_kg=enthalpy_j_kg,
                 vapor_quality_mass=quality,
                 heat_leak_w_per_m=heat_leak_w_per_m,
+                liquid_mole_fractions=state.liquid_mole_fractions,
+                vapor_mole_fractions=state.vapor_mole_fractions,
             )
         )
         if quality > 0.0 and first_two_phase_position is None:

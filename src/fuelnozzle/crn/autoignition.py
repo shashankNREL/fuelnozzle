@@ -31,6 +31,7 @@ from enum import StrEnum
 
 import cantera as ct
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
 
 from fuelnozzle.crn.chemistry import (
     DRY_AIR_MOLE_FRACTIONS,
@@ -61,6 +62,26 @@ class AutoignitionVerdict(StrEnum):
     UNSAFE = "unsafe"
     UNKNOWN = "unknown"
     NO_PREMIXER = "no_premixing_passage"
+
+
+class IgnitionEvidenceState(StrEnum):
+    """What a table query actually establishes."""
+
+    INTERPOLATED = "interpolated"
+    CENSORED_LOWER_BOUND = "censored_lower_bound"
+    UNAVAILABLE = "unavailable"
+
+
+class IgnitionMarker(StrEnum):
+    TEMPERATURE_RISE = "temperature_rise"
+    MAX_TEMPERATURE_RATE = "maximum_temperature_rate"
+
+
+@dataclass(frozen=True)
+class IgnitionDelayEvidence:
+    state: IgnitionEvidenceState
+    delay_s: float | None
+    lower_bound_s: float | None
 
 
 @dataclass(frozen=True)
@@ -94,6 +115,7 @@ class AutoignitionMargin:
     mechanism_path: str
     used_dedicated_ignition_mechanism: bool
     warnings: tuple[ModelWarning, ...]
+    evidence_state: IgnitionEvidenceState = IgnitionEvidenceState.UNAVAILABLE
 
 
 def premix_state(
@@ -176,6 +198,7 @@ def ignition_delay(
     equivalence_ratio: float,
     oxidizer_mole_fractions: dict[str, float] | None = None,
     max_time_s: float = MAX_IGNITION_TIME_S,
+    marker: IgnitionMarker = IgnitionMarker.TEMPERATURE_RISE,
 ) -> float | None:
     """Homogeneous constant-pressure ignition delay, or ``None`` if it does not ignite.
 
@@ -193,10 +216,28 @@ def ignition_delay(
     reactor = ct.IdealGasConstPressureReactor(solution, clone=False)
     network = ct.ReactorNet([reactor])
     target = temperature_k + IGNITION_TEMPERATURE_RISE_K
+    previous_time = 0.0
+    previous_temperature = temperature_k
+    peak_rate = 0.0
+    peak_rate_time: float | None = None
     while network.time < max_time_s:
         network.step()
-        if reactor.T >= target:
+        elapsed = network.time - previous_time
+        rate = (
+            (reactor.T - previous_temperature) / elapsed if elapsed > 0.0 else 0.0
+        )
+        if rate > peak_rate:
+            peak_rate = rate
+            peak_rate_time = float(network.time)
+        previous_time = float(network.time)
+        previous_temperature = float(reactor.T)
+        if marker is IgnitionMarker.TEMPERATURE_RISE and reactor.T >= target:
             return float(network.time)
+    if (
+        marker is IgnitionMarker.MAX_TEMPERATURE_RATE
+        and reactor.T >= temperature_k + 50.0
+    ):
+        return peak_rate_time
     return None
 
 
@@ -226,6 +267,7 @@ class IgnitionDelayTable:
         self.pressures_pa = tuple(sorted(pressures_pa))
         self.equivalence_ratios = tuple(sorted(equivalence_ratios))
         self._oxidizer = oxidizer_mole_fractions or DRY_AIR_MOLE_FRACTIONS
+        self.max_time_s = MAX_IGNITION_TIME_S
 
         solution = registry.new_solution(fuel, MechanismRole.IGNITION_DELAY)
         shape = (
@@ -234,6 +276,7 @@ class IgnitionDelayTable:
             len(self.equivalence_ratios),
         )
         self._log_delay = np.full(shape, np.nan)
+        self._censored = np.zeros(shape, dtype=float)
         for i, temperature in enumerate(self.temperatures_k):
             for j, pressure in enumerate(self.pressures_pa):
                 for k, phi in enumerate(self.equivalence_ratios):
@@ -242,35 +285,66 @@ class IgnitionDelayTable:
                     )
                     if delay is not None and delay > 0.0:
                         self._log_delay[i, j, k] = np.log(delay)
+                    else:
+                        self._censored[i, j, k] = 1.0
 
     def __call__(
         self, temperature_k: float, pressure_pa: float, equivalence_ratio: float
     ) -> float | None:
-        """Interpolated ignition delay, or ``None`` where the mixture does not ignite."""
-        inverse = 1.0 / np.array(self.temperatures_k)
-        query_inverse = 1.0 / temperature_k
+        """Interpolated ignition delay; use :meth:`evaluate` for evidence state."""
+        return self.evaluate(temperature_k, pressure_pa, equivalence_ratio).delay_s
 
-        # Interpolate along 1/T at the nearest pressure and equivalence ratio, which is
-        # adequate because the temperature dependence is by far the strongest.
-        pressure_index = int(
-            np.argmin(np.abs(np.array(self.pressures_pa) - pressure_pa))
-        )
-        phi_index = int(
-            np.argmin(np.abs(np.array(self.equivalence_ratios) - equivalence_ratio))
-        )
-        column = self._log_delay[:, pressure_index, phi_index]
-        valid = ~np.isnan(column)
-        if valid.sum() < 2:
-            return None
+    def evaluate(
+        self,
+        temperature_k: float,
+        pressure_pa: float,
+        equivalence_ratio: float,
+    ) -> IgnitionDelayEvidence:
+        """Bounded three-dimensional interpolation in ``log(tau)`` and ``1/T``."""
+        if (
+            not self.temperatures_k[0] <= temperature_k <= self.temperatures_k[-1]
+            or not self.pressures_pa[0] <= pressure_pa <= self.pressures_pa[-1]
+            or not self.equivalence_ratios[0]
+            <= equivalence_ratio
+            <= self.equivalence_ratios[-1]
+        ):
+            return IgnitionDelayEvidence(
+                IgnitionEvidenceState.UNAVAILABLE, None, None
+            )
 
-        order = np.argsort(inverse[valid])
-        result = np.interp(
-            query_inverse, inverse[valid][order], column[valid][order],
-            left=np.nan, right=np.nan,
+        inverse_temperatures = 1.0 / np.asarray(self.temperatures_k)
+        order = np.argsort(inverse_temperatures)
+        axes = (
+            inverse_temperatures[order],
+            np.asarray(self.pressures_pa),
+            np.asarray(self.equivalence_ratios),
         )
-        if np.isnan(result):
-            return None
-        return float(np.exp(result))
+        query = (1.0 / temperature_k, pressure_pa, equivalence_ratio)
+        censor_fraction = float(
+            RegularGridInterpolator(
+                axes,
+                self._censored[order, :, :],
+                bounds_error=True,
+            )(query)
+        )
+        log_delay = float(
+            RegularGridInterpolator(
+                axes,
+                self._log_delay[order, :, :],
+                bounds_error=True,
+            )(query)
+        )
+        if censor_fraction > 0.0 or np.isnan(log_delay):
+            return IgnitionDelayEvidence(
+                IgnitionEvidenceState.CENSORED_LOWER_BOUND,
+                None,
+                self.max_time_s,
+            )
+        return IgnitionDelayEvidence(
+            IgnitionEvidenceState.INTERPOLATED,
+            float(np.exp(log_delay)),
+            None,
+        )
 
 
 def autoignition_margin(
@@ -299,7 +373,43 @@ def autoignition_margin(
             )
         )
 
-    delay = table(premix.temperature_k, premix.pressure_pa, premix.equivalence_ratio)
+    evidence = table.evaluate(
+        premix.temperature_k,
+        premix.pressure_pa,
+        premix.equivalence_ratio,
+    )
+    delay = evidence.delay_s
+    if evidence.state is IgnitionEvidenceState.CENSORED_LOWER_BOUND:
+        lower_margin = evidence.lower_bound_s / residence_time_s
+        verdict = (
+            AutoignitionVerdict.SAFE
+            if lower_margin >= minimum_margin
+            else AutoignitionVerdict.UNKNOWN
+        )
+        warnings.append(
+            ModelWarning(
+                code="IGNITION_DELAY_CENSORED",
+                severity=WarningSeverity.INFO,
+                message=(
+                    f"No ignition occurred within {evidence.lower_bound_s:g} s. The "
+                    f"autoignition margin is therefore bounded below by {lower_margin:.3g}, "
+                    "not assigned an invented delay."
+                ),
+            )
+        )
+        return AutoignitionMargin(
+            fuel=fuel,
+            premix=premix,
+            ignition_delay_s=None,
+            residence_time_s=residence_time_s,
+            margin=lower_margin,
+            minimum_margin=minimum_margin,
+            verdict=verdict,
+            mechanism_path=table.spec.path,
+            used_dedicated_ignition_mechanism=table.uses_dedicated_mechanism,
+            warnings=tuple(warnings),
+            evidence_state=evidence.state,
+        )
     if delay is None:
         warnings.append(
             ModelWarning(
@@ -320,6 +430,7 @@ def autoignition_margin(
             mechanism_path=table.spec.path,
             used_dedicated_ignition_mechanism=table.uses_dedicated_mechanism,
             warnings=tuple(warnings),
+            evidence_state=evidence.state,
         )
 
     margin = delay / residence_time_s
@@ -360,6 +471,7 @@ def autoignition_margin(
         mechanism_path=table.spec.path,
         used_dedicated_ignition_mechanism=table.uses_dedicated_mechanism,
         warnings=tuple(warnings),
+        evidence_state=evidence.state,
     )
 
 
@@ -372,6 +484,7 @@ class FlashbackScreen:
     margin: float | None
     is_safe: bool | None
     warnings: tuple[ModelWarning, ...]
+    calibration_id: str | None = None
 
 
 def flashback_screen(
@@ -380,6 +493,7 @@ def flashback_screen(
     turbulence_intensity: float = 0.1,
     turbulent_factor_coefficient: float = 3.5,
     turbulent_factor_exponent: float = 0.5,
+    correlation_calibration_id: str | None = None,
 ) -> FlashbackScreen:
     """Compare the passage velocity with how fast a flame could climb it.
 
@@ -411,6 +525,7 @@ def flashback_screen(
                     ),
                 ),
             ),
+            calibration_id=correlation_calibration_id,
         )
 
     fluctuation = turbulence_intensity * passage_velocity_m_s
@@ -444,10 +559,47 @@ def flashback_screen(
             ),
         )
     )
+    if correlation_calibration_id is None:
+        warnings.append(
+            ModelWarning(
+                code="FLASHBACK_CORRELATION_UNCALIBRATED",
+                severity=WarningSeverity.WARNING,
+                message=(
+                    "The turbulent-flame-speed correlation has no calibration identifier "
+                    "for this passage; a numerically safe screen is not acceptance evidence."
+                ),
+            )
+        )
     return FlashbackScreen(
         passage_velocity_m_s=passage_velocity_m_s,
         turbulent_flame_speed_m_s=turbulent,
         margin=margin,
         is_safe=margin >= 1.0,
         warnings=tuple(warnings),
+        calibration_id=correlation_calibration_id,
     )
+
+
+def laminar_flame_speed(
+    solution: ct.Solution,
+    spec: MechanismSpec,
+    temperature_k: float,
+    pressure_pa: float,
+    equivalence_ratio: float,
+    *,
+    width_m: float = 0.03,
+    oxidizer_mole_fractions: dict[str, float] | None = None,
+) -> float:
+    """Compute an unstretched freely propagating flame speed where the mechanism supports it."""
+    if min(temperature_k, pressure_pa, equivalence_ratio, width_m) <= 0.0:
+        raise ValueError("Flame-speed state and domain width must be positive")
+    solution.TP = temperature_k, pressure_pa
+    solution.set_equivalence_ratio(
+        equivalence_ratio,
+        spec.fuel_string,
+        oxidizer_mole_fractions or DRY_AIR_MOLE_FRACTIONS,
+    )
+    flame = ct.FreeFlame(solution, width=width_m)
+    flame.set_refine_criteria(ratio=3.0, slope=0.08, curve=0.12)
+    flame.solve(loglevel=0, auto=True)
+    return float(flame.velocity[0])

@@ -100,3 +100,5 @@ class ThermodynamicState:
     conductivity_w_m_k: float | None
     surface_tension_n_m: float | None
     transport_model: str
+    liquid_mole_fractions: dict[str, float] | None = None
+    vapor_mole_fractions: dict[str, float] | None = None

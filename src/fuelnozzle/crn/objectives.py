@@ -11,8 +11,9 @@ find that trade because nothing stops it. Feasibility-first makes the trade unav
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from math import nan
 
 from fuelnozzle.crn.autoignition import AutoignitionVerdict
 from fuelnozzle.crn.chemistry import FuelKind
@@ -24,8 +25,11 @@ from fuelnozzle.models import WarningSeverity
 class ObjectiveName(StrEnum):
     """The quantities being minimized. All are phrased so that smaller is better."""
 
-    JET_A_NOX = "jet_a_nox"
-    LNG_NOX = "lng_nox"
+    JET_A_LTO_DP_FOO = "jet_a_lto_dp_foo"
+    LNG_CRUISE_NOX = "lng_cruise_nox"
+    # Compatibility aliases. Their definitions are now the mission-specific quantities.
+    JET_A_NOX = "jet_a_lto_dp_foo"
+    LNG_NOX = "lng_cruise_nox"
     MIXING_NONUNIFORMITY = "mixing_nonuniformity"
     EXIT_TEMPERATURE_SPREAD = "exit_temperature_spread"
 
@@ -45,6 +49,7 @@ class ObjectiveVector:
 
     values: dict[ObjectiveName, float]
     violations: tuple[ConstraintViolation, ...]
+    named_metrics: dict[str, float] = field(default_factory=dict)
 
     @property
     def is_feasible(self) -> bool:
@@ -93,6 +98,15 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
                     detail="the network converged to an unlit solution",
                 )
             )
+        for gate in point.gates:
+            if gate.status is GateStatus.FAIL and gate.name != "autoignition":
+                violations.append(
+                    ConstraintViolation(
+                        name=f"{label}:{gate.name}",
+                        amount=1.0,
+                        detail=gate.reason,
+                    )
+                )
         margin = point.autoignition
         if margin is not None:
             if margin.verdict is AutoignitionVerdict.UNKNOWN:
@@ -127,24 +141,55 @@ def evaluate_objectives(result: DesignResult) -> ObjectiveVector:
                     )
                 )
 
-    jet_a = result.weighted_ei_nox(FuelKind.JET_A)
+    lto = result.lto_emissions()
+    jet_a = (
+        lto.dp_foo_g_per_kn
+        if lto is not None
+        else result.weighted_ei_nox(FuelKind.JET_A)
+    )
+    if result.by_fuel(FuelKind.JET_A) and lto is None:
+        violations.append(
+            ConstraintViolation(
+                name="jet_a_lto_dp_foo:unavailable",
+                amount=1.0,
+                detail=(
+                    "rated thrust is missing; the stored Jet-A value is a diagnostic "
+                    "fuel-mass-weighted EI, not Dp/Foo"
+                ),
+            )
+        )
+    if lto is not None and len(lto.modes) != 4:
+        violations.append(
+            ConstraintViolation(
+                name="jet_a_lto_dp_foo:incomplete_cycle",
+                amount=(4 - len(lto.modes)) / 4.0,
+                detail="all four ICAO LTO modes are required",
+            )
+        )
     lng = result.weighted_ei_nox(FuelKind.LNG)
-    spreads = [point.equivalence_ratio_spread for point in result.points]
-    exit_spreads = [point.exit_temperature_spread_k for point in result.points]
+    named_metrics = {
+        **{
+            f"jet_a:{point.point.name}:ei_nox_g_per_kg": point.ei_nox_g_per_kg
+            for point in result.by_fuel(FuelKind.JET_A)
+        },
+        **{
+            f"lng:{name}:ei_nox_g_per_kg": value
+            for name, value in result.lng_cruise_ei_by_point().items()
+        },
+    }
+    if lto is not None:
+        named_metrics["jet_a:lto:dp_foo_g_per_kn"] = lto.dp_foo_g_per_kn
 
     return ObjectiveVector(
         values={
-            ObjectiveName.JET_A_NOX: jet_a,
-            ObjectiveName.LNG_NOX: lng,
-            # Uniform mixing is the goal, so the spread itself is minimized.
-            ObjectiveName.MIXING_NONUNIFORMITY: (
-                sum(spreads) / len(spreads) if spreads else 0.0
-            ),
-            ObjectiveName.EXIT_TEMPERATURE_SPREAD: (
-                sum(exit_spreads) / len(exit_spreads) if exit_spreads else 0.0
-            ),
+            ObjectiveName.JET_A_LTO_DP_FOO: jet_a,
+            ObjectiveName.LNG_CRUISE_NOX: lng,
+            # These invalid serial-reactor proxies are deliberately not optimized.
+            ObjectiveName.MIXING_NONUNIFORMITY: nan,
+            ObjectiveName.EXIT_TEMPERATURE_SPREAD: nan,
         },
         violations=tuple(violations),
+        named_metrics=named_metrics,
     )
 
 
@@ -152,12 +197,13 @@ def rank_key(objective: ObjectiveVector, order: tuple[ObjectiveName, ...]) -> tu
     """Sort key implementing feasibility-first ranking.
 
     Feasible designs sort before infeasible ones regardless of objective value; among
-    infeasible designs, less violation sorts first.
+    infeasible designs, less violation sorts first. Remaining ties follow the caller's
+    explicit objective priority lexicographically; no mixed-unit scalar is formed.
     """
     return (
         0 if objective.is_feasible else 1,
         objective.total_violation,
-        sum(objective.as_tuple(order)),
+        objective.as_tuple(order),
     )
 
 

@@ -24,10 +24,16 @@ fuel changes the total gas mass flow and therefore the mass balance itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import pi
 
 import cantera as ct
 
-from fuelnozzle.crn.droplets import GasState, LiquidPropertyProvider, integrate_droplet
+from fuelnozzle.crn.droplets import (
+    GasState,
+    LiquidPropertyProvider,
+    integrate_droplet,
+    taylor_analogy_breakup,
+)
 from fuelnozzle.crn.network import CombustorNetwork, NetworkSolution
 from fuelnozzle.crn.reactors import InletSpec, OutletSpec, ReactorSpec
 from fuelnozzle.crn.spray_source import SprayBoundary
@@ -49,6 +55,7 @@ class ZoneEvaporation:
     heat_drawn_from_gas_w: float
     mean_vapor_temperature_k: float
     exiting_liquid_mass_flow_kg_s: float
+    exiting_mean_velocity_m_s: float
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,8 @@ class CoupledSolution:
     converged: bool
     evaporated_fraction: float
     liquid_carryover_kg_s: float
+    fuel_mass_residual_kg_s: float
+    integrated_droplet_heat_w: float
     warnings: tuple[ModelWarning, ...]
 
 
@@ -74,7 +83,7 @@ def solve_coupled(
     spray: SprayBoundary,
     liquid_provider: LiquidPropertyProvider,
     spray_path: tuple[str, ...] | list[str],
-    fuel_species: str,
+    fuel_species: str | dict[str, float],
     *,
     fixed_internal_flows: (
         frozenset[tuple[str, str]] | set[tuple[str, str]] | None
@@ -110,6 +119,41 @@ def solve_coupled(
     heat: dict[str, float] = {}
 
     warnings: list[ModelWarning] = []
+    if pressure_pa > 5.0e6:
+        warnings.append(
+            ModelWarning(
+                code="DROPLET_CORRELATION_HIGH_PRESSURE",
+                severity=WarningSeverity.WARNING,
+                message=(
+                    "The TAB and isolated-droplet transfer correlations are being used "
+                    "above 5 MPa without a dense-gas calibration; spray conclusions are "
+                    "screening-level."
+                ),
+            )
+        )
+    if spray.fuel.value == "jet_a":
+        warnings.append(
+            ModelWarning(
+                code="JET_A_SINGLE_SURROGATE_EVAPORATION",
+                severity=WarningSeverity.WARNING,
+                message=(
+                    "Jet-A evaporation uses one lumped liquid/surrogate composition. "
+                    "Preferential multicomponent evaporation is not represented, so this "
+                    "coupled solve is screening-level."
+                ),
+            )
+        )
+    if spray.cone_angle_deg is not None:
+        warnings.append(
+            ModelWarning(
+                code="WALL_IMPINGEMENT_UNAVAILABLE",
+                severity=WarningSeverity.WARNING,
+                message=(
+                    "No chamber envelope or trajectory-to-wall intersection was supplied; "
+                    "wall impingement cannot be excluded."
+                ),
+            )
+        )
     zones: tuple[ZoneEvaporation, ...] = ()
     previous_temperatures: dict[str, float] = {}
     previous_evaporated = -1.0
@@ -128,7 +172,7 @@ def solve_coupled(
 
         zones = _march_droplets(
             solution, network, spray, liquid_provider, path, pressure_pa,
-            solution_factory, heat_transfer_scaling,
+            solution_factory, heat_transfer_scaling, fuel_species,
         )
 
         evaporated = sum(zone.evaporated_mass_flow_kg_s for zone in zones)
@@ -190,7 +234,25 @@ def solve_coupled(
         )
 
     carryover = zones[-1].exiting_liquid_mass_flow_kg_s if zones else 0.0
+    evaporated_flow = sum(zone.evaporated_mass_flow_kg_s for zone in zones)
+    fuel_mass_residual = (
+        spray.total_fuel_mass_flow_kg_s
+        - spray.vapor_mass_flow_kg_s
+        - evaporated_flow
+        - carryover
+    )
     total_fuel = max(spray.total_fuel_mass_flow_kg_s, 1.0e-12)
+    if abs(fuel_mass_residual) > 1.0e-9 * total_fuel:
+        warnings.append(
+            ModelWarning(
+                code="COUPLED_FUEL_MASS_IMBALANCE",
+                severity=WarningSeverity.ERROR,
+                message=(
+                    f"The nozzle-to-network fuel ledger leaves {fuel_mass_residual:.4g} "
+                    "kg/s unaccounted for."
+                ),
+            )
+        )
     if carryover > 1.0e-6 * total_fuel:
         warnings.append(
             ModelWarning(
@@ -213,6 +275,8 @@ def solve_coupled(
         converged=converged,
         evaporated_fraction=evaporated_fraction,
         liquid_carryover_kg_s=carryover,
+        fuel_mass_residual_kg_s=fuel_mass_residual,
+        integrated_droplet_heat_w=sum(zone.heat_drawn_from_gas_w for zone in zones),
         warnings=tuple(warnings),
     )
 
@@ -226,7 +290,7 @@ def _build(
     heat: dict[str, float],
     base_heat: dict[str, float],
     spray: SprayBoundary,
-    fuel_species: str,
+    fuel_species: str | dict[str, float],
     air_total: float,
     first_zone: str,
     fixed_internal_flows: (
@@ -240,6 +304,11 @@ def _build(
     latent heat it had just spent, and every zone would run hot.
     """
     inlets = list(air_inlets)
+    default_composition = (
+        {fuel_species: 1.0} if isinstance(fuel_species, str) else fuel_species
+    )
+    flashed_composition = spray.vapor_mole_fractions or default_composition
+    evaporated_composition = spray.liquid_mole_fractions or default_composition
     if spray.vapor_mass_flow_kg_s > 0.0:
         inlets.append(
             InletSpec(
@@ -247,7 +316,7 @@ def _build(
                 target_reactor=first_zone,
                 mass_flow_kg_s=spray.vapor_mass_flow_kg_s,
                 temperature_k=spray.vapor_temperature_k,
-                mole_fractions={fuel_species: 1.0},
+                mole_fractions=flashed_composition,
             )
         )
     gas_fuel = spray.vapor_mass_flow_kg_s
@@ -261,7 +330,7 @@ def _build(
                 target_reactor=name,
                 mass_flow_kg_s=flow,
                 temperature_k=max(temperature, 1.0),
-                mole_fractions={fuel_species: 1.0},
+                mole_fractions=evaporated_composition,
             )
         )
 
@@ -320,6 +389,7 @@ def _march_droplets(
     pressure_pa: float,
     solution_factory,
     heat_transfer_scaling: float,
+    fuel_species: str | dict[str, float],
 ) -> tuple[ZoneEvaporation, ...]:
     """Carry every droplet class along the spray path with the gas held fixed."""
     template = solution_factory()
@@ -333,7 +403,26 @@ def _march_droplets(
     for reactor_name in spray_path:
         reactor = solution.by_name(reactor_name)
         spec = next(item for item in network.reactors if item.name == reactor_name)
-        gas = _gas_state(template, reactor, pressure_pa)
+        gas_velocity = (
+            spec.spray_path_length_m / reactor.residence_time_s
+            if spec.spray_path_length_m is not None and reactor.residence_time_s > 0.0
+            else 0.0
+        )
+        fallback_composition = (
+            {fuel_species: 1.0} if isinstance(fuel_species, str) else fuel_species
+        )
+        fuel_composition = (
+            spray.liquid_mole_fractions
+            or spray.vapor_mole_fractions
+            or fallback_composition
+        )
+        gas = _gas_state(
+            template,
+            reactor,
+            pressure_pa,
+            fuel_composition,
+            gas_velocity,
+        )
 
         evaporated = 0.0
         heat_drawn = 0.0
@@ -353,6 +442,25 @@ def _march_droplets(
             )
             residence = min(max(residence, 1.0e-9), 1.0)
 
+            slip = velocity - gas.velocity_m_s
+            if spray.apply_aerodynamic_breakup and reactor_name == spray_path[0]:
+                breakup = taylor_analogy_breakup(
+                    gas,
+                    liquid_provider,
+                    radius,
+                    temperature,
+                    abs(slip),
+                )
+                radius = breakup.final_radius_m
+
+            liquid_at_entry = liquid_provider.liquid_state(temperature, pressure_pa)
+            single_drop_mass = (
+                (4.0 / 3.0)
+                * pi
+                * radius**3
+                * liquid_at_entry.density_kg_m3
+            )
+            number_rate = mass_flow / single_drop_mass
             history = integrate_droplet(
                 gas, liquid_provider, radius, temperature, velocity,
                 residence_time_s=residence, heat_transfer_scaling=heat_transfer_scaling,
@@ -362,16 +470,18 @@ def _march_droplets(
             evaporated += released
             weighted_temperature += released * history.final_temperature_k
 
-            # Heat the gas gave up, from the droplet energy balance integrated over the
-            # zone: latent heat for what vaporized, plus sensible heat for what did not.
-            liquid = liquid_provider.liquid_state(history.final_temperature_k, pressure_pa)
-            heat_drawn += released * liquid.latent_heat_j_kg + remaining * (
-                liquid.specific_heat_j_kg_k * (history.final_temperature_k - temperature)
-            )
+            # The ODE integrates the instantaneous convective heat. This avoids
+            # reconstructing a variable-property enthalpy change from endpoint values.
+            heat_drawn += number_rate * history.heat_drawn_from_gas_j
 
             if remaining > 0.0 and history.final_radius_m > 0.0:
                 next_surviving.append(
-                    (history.final_radius_m, history.final_temperature_k, remaining, velocity)
+                    (
+                        history.final_radius_m,
+                        history.final_temperature_k,
+                        remaining,
+                        history.final_velocity_m_s,
+                    )
                 )
 
         zones.append(
@@ -385,6 +495,12 @@ def _march_droplets(
                     else gas.temperature_k
                 ),
                 exiting_liquid_mass_flow_kg_s=sum(item[2] for item in next_surviving),
+                exiting_mean_velocity_m_s=(
+                    sum(item[2] * item[3] for item in next_surviving)
+                    / sum(item[2] for item in next_surviving)
+                    if next_surviving
+                    else gas.velocity_m_s
+                ),
             )
         )
         surviving = next_surviving
@@ -392,9 +508,19 @@ def _march_droplets(
     return tuple(zones)
 
 
-def _gas_state(template: ct.Solution, reactor, pressure_pa: float) -> GasState:
+def _gas_state(
+    template: ct.Solution,
+    reactor,
+    pressure_pa: float,
+    fuel_mole_fractions: dict[str, float] | None = None,
+    velocity_m_s: float = 0.0,
+) -> GasState:
     """Gas conditions a droplet sees inside one reactor, with transport properties."""
     template.TPY = reactor.temperature_k, pressure_pa, reactor.mass_fractions
+    fuel_mass_fraction = 0.0
+    for species in fuel_mole_fractions or {}:
+        if species in template.species_names:
+            fuel_mass_fraction += float(template.Y[template.species_index(species)])
     return GasState(
         temperature_k=float(template.T),
         pressure_pa=pressure_pa,
@@ -403,5 +529,6 @@ def _gas_state(template: ct.Solution, reactor, pressure_pa: float) -> GasState:
         conductivity_w_m_k=float(template.thermal_conductivity),
         specific_heat_j_kg_k=float(template.cp_mass),
         mean_molecular_weight_kg_mol=float(template.mean_molecular_weight) / 1000.0,
-        fuel_vapor_mass_fraction=0.0,
+        fuel_vapor_mass_fraction=min(1.0, max(0.0, fuel_mass_fraction)),
+        velocity_m_s=velocity_m_s,
     )

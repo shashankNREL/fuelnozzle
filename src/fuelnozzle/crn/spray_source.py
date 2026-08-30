@@ -27,7 +27,7 @@ from math import gamma, log, pi
 
 from fuelnozzle.crn.chemistry import FuelKind
 from fuelnozzle.jet_a import PressureSwirlResult
-from fuelnozzle.models import ModelWarning, WarningSeverity
+from fuelnozzle.models import COOLPROP_TO_CANTERA_SPECIES, ModelWarning, WarningSeverity
 from fuelnozzle.spray import FlashSprayRegime, Tier3FlashSpray
 
 #: Regimes in which breakup is driven by internal vaporization, not aerodynamics.
@@ -87,6 +87,8 @@ class SprayBoundary:
     size_policy: InitialSizePolicy
     calibration_id: str | None
     warnings: tuple[ModelWarning, ...]
+    vapor_mole_fractions: dict[str, float] | None = None
+    liquid_mole_fractions: dict[str, float] | None = None
 
     @property
     def vapor_mass_fraction(self) -> float:
@@ -242,6 +244,19 @@ def lng_spray_boundary(
     """
     warnings = list(result.warnings)
     boundary = result.cfd_boundary
+    def cantera_composition(
+        composition: dict[str, float] | None,
+    ) -> dict[str, float] | None:
+        if composition is None:
+            return None
+        return {
+            COOLPROP_TO_CANTERA_SPECIES[name]: fraction
+            for name, fraction in composition.items()
+            if fraction > 0.0 and name in COOLPROP_TO_CANTERA_SPECIES
+        } or None
+
+    vapor_composition = cantera_composition(boundary.vapor_mole_fractions)
+    liquid_composition = cantera_composition(boundary.liquid_mole_fractions)
     vapor_fraction = min(1.0, max(0.0, result.actual_exit_vapor_quality_mass))
     vapor_flow = fuel_mass_flow_kg_s * vapor_fraction
     liquid_flow = fuel_mass_flow_kg_s - vapor_flow
@@ -283,6 +298,8 @@ def lng_spray_boundary(
             size_policy=policy,
             calibration_id=result.calibration_id,
             warnings=tuple(warnings),
+            vapor_mole_fractions=vapor_composition,
+            liquid_mole_fractions=liquid_composition,
         )
 
     radius, resolved_policy, extra = _resolve_initial_radius(
@@ -318,6 +335,8 @@ def lng_spray_boundary(
         size_policy=resolved_policy,
         calibration_id=result.calibration_id,
         warnings=tuple(warnings),
+        vapor_mole_fractions=vapor_composition,
+        liquid_mole_fractions=liquid_composition,
     )
 
 

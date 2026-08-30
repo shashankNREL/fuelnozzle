@@ -265,6 +265,33 @@ class CoolPropLNGProvider:
         phase_index = self._state.phase()
         phase = self._phase_name(phase_index)
         quality = self._mass_quality() if phase_index == CP.iphase_twophase else None
+        liquid_composition: dict[str, float] | None = None
+        vapor_composition: dict[str, float] | None = None
+        if phase_index == CP.iphase_twophase:
+            liquid_composition = dict(
+                zip(
+                    self.composition.components,
+                    self._state.mole_fractions_liquid(),
+                    strict=True,
+                )
+            )
+            vapor_composition = dict(
+                zip(
+                    self.composition.components,
+                    self._state.mole_fractions_vapor(),
+                    strict=True,
+                )
+            )
+        elif phase_index in (
+            CP.iphase_gas,
+            CP.iphase_supercritical_gas,
+        ):
+            vapor_composition = dict(self.composition.mole_fractions)
+        elif phase_index in (
+            CP.iphase_liquid,
+            CP.iphase_supercritical_liquid,
+        ):
+            liquid_composition = dict(self.composition.mole_fractions)
         viscosity = self._optional_property(self._state.viscosity)
         conductivity = self._optional_property(self._state.conductivity)
         surface_tension = self._optional_property(self._state.surface_tension)
@@ -292,6 +319,8 @@ class CoolPropLNGProvider:
             conductivity_w_m_k=conductivity,
             surface_tension_n_m=surface_tension,
             transport_model=transport_model,
+            liquid_mole_fractions=liquid_composition,
+            vapor_mole_fractions=vapor_composition,
         )
 
     def _component_transport_fallback(

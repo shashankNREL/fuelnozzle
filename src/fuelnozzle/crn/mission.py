@@ -84,6 +84,9 @@ class MissionProfile:
         """Build named LNG cruise points from an engine-cycle deck."""
         if not points:
             raise ValueError("At least one cruise point is required")
+        names = [point.name.strip() for point in points]
+        if any(not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("Cruise point names must be non-empty and distinct")
         resolved = tuple(mission_point_from_operating(point, sector) for point in points)
         if any(point.fuel is not FuelKind.LNG for point in resolved):
             raise ValueError("Every cruise point must burn LNG")

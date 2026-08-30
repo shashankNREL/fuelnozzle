@@ -11,6 +11,7 @@ import pytest
 from fuelnozzle.crn.autoignition import (
     AutoignitionVerdict,
     IgnitionDelayTable,
+    IgnitionEvidenceState,
     autoignition_margin,
     flashback_screen,
     ignition_delay,
@@ -23,6 +24,7 @@ from fuelnozzle.crn.chemistry import (
     MechanismSpec,
 )
 from fuelnozzle.crn.thermal import (
+    InfeasibleThermalTargetError,
     SupercriticalFeedError,
     heat_sink_budget,
     idle_circuit_screen,
@@ -202,7 +204,11 @@ def jet_a_margin(residence_time_s: float, minimum_margin: float = 4.0):
         fuel_temperature_k=470.0, pressure_pa=PRESSURE_PA,
     )
     table = IgnitionDelayTable(
-        reg, FuelKind.JET_A, (700.0, 750.0, 800.0, 850.0, 900.0), (PRESSURE_PA,), (0.5,)
+        reg,
+        FuelKind.JET_A,
+        (700.0, 750.0, 800.0, 850.0, 900.0),
+        (PRESSURE_PA,),
+        (0.4, 0.5, 0.6),
     )
     return autoignition_margin(
         table, state, residence_time_s, FuelKind.JET_A, minimum_margin=minimum_margin
@@ -395,7 +401,7 @@ def test_available_heat_can_bound_the_window_from_above():
     )
     limited = thermal_window(
         provider, candidates, chamber_pressure_pa=2.0e6, feed_pressure_pa=4.0e6,
-        mass_flow_kg_s=0.08, tank_temperature_k=112.0, available_heat_w=4.6e4,
+        mass_flow_kg_s=0.08, tank_temperature_k=112.0, available_heat_w=2.0e4,
     )
     assert len(limited.feasible_temperatures_k) < len(generous.feasible_temperatures_k)
 
@@ -406,6 +412,39 @@ def test_duty_inverts_back_to_a_temperature():
     duty = heat_sink_budget(provider, 0.08, 112.0, target, 2.0e6).total_duty_w
     recovered = solve_temperature_for_duty(provider, 0.08, 112.0, 2.0e6, duty)
     assert recovered == pytest.approx(target, abs=1.0)
+
+
+def test_multicomponent_lng_uses_partial_quality_inside_temperature_glide():
+    provider = CoolPropLNGProvider(
+        LNGComposition(
+            mole_fractions={"Methane": 0.90, "Ethane": 0.08, "Propane": 0.02}
+        )
+    )
+    bubble = provider.bubble_state_at_pressure(2.0e6)
+    dew = provider.dew_state_at_pressure(2.0e6)
+    midpoint = 0.5 * (bubble.temperature_k + dew.temperature_k)
+    budget = heat_sink_budget(provider, 0.08, 112.0, midpoint, 2.0e6)
+    assert 0.0 < budget.vapor_quality < 1.0
+    full_latent = 0.08 * (dew.enthalpy_j_kg - bubble.enthalpy_j_kg)
+    assert 0.0 < budget.latent_w < full_latent
+
+
+def test_inverse_thermal_targets_outside_bracket_raise_instead_of_clamping():
+    with pytest.raises(InfeasibleThermalTargetError):
+        solve_temperature_for_duty(
+            lng_provider(), 0.08, 112.0, 2.0e6, 1.0e9
+        )
+
+
+def test_ignition_table_distinguishes_out_of_domain_from_censored():
+    table = IgnitionDelayTable(
+        registry(), FuelKind.LNG, (700.0, 800.0), (PRESSURE_PA,), (0.5,)
+    )
+    censored = table.evaluate(750.0, PRESSURE_PA, 0.5)
+    outside = table.evaluate(750.0, PRESSURE_PA, 0.8)
+    assert censored.state is IgnitionEvidenceState.CENSORED_LOWER_BOUND
+    assert censored.lower_bound_s is not None
+    assert outside.state is IgnitionEvidenceState.UNAVAILABLE
 
 
 # --- Idle circuit -----------------------------------------------------------------------

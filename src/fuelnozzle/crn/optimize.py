@@ -37,10 +37,8 @@ from fuelnozzle.crn.objectives import (
 from fuelnozzle.models import ModelWarning, WarningSeverity
 
 DEFAULT_ORDER = (
-    ObjectiveName.JET_A_NOX,
-    ObjectiveName.LNG_NOX,
-    ObjectiveName.MIXING_NONUNIFORMITY,
-    ObjectiveName.EXIT_TEMPERATURE_SPREAD,
+    ObjectiveName.JET_A_LTO_DP_FOO,
+    ObjectiveName.LNG_CRUISE_NOX,
 )
 
 
@@ -200,6 +198,7 @@ class SharedLinerCost:
     is_degenerate: bool
     sample_count: int
     unbracketed: tuple[str, ...] = ()
+    varied_coordinate: str | None = None
 
     @property
     def worst_penalty(self) -> float:
@@ -281,16 +280,26 @@ def cost_of_shared_liner(
         compromise.design == jet_a_only.design or compromise.design == lng_only.design
     )
 
-    # An optimum sitting at the first or last sample of a sweep was never bracketed: the
-    # objective was still improving when the range ran out, so the true optimum lies
-    # outside it and any penalty measured against it understates the real one.
+    # Identify a one-dimensional sweep from the actual varied design coordinate. Insertion
+    # order is not physical ordering (Latin-hypercube samples are deliberately shuffled).
+    dumped = [sample.design.model_dump() for sample in pool]
+    varied = [
+        name
+        for name in dumped[0]
+        if len({values[name] for values in dumped}) > 1
+    ] if dumped else []
+    varied_coordinate = varied[0] if len(varied) == 1 else None
     unbracketed: list[str] = []
-    if len(pool) >= 3:
+    if len(pool) >= 3 and varied_coordinate is not None:
+        ordered_pool = sorted(
+            pool,
+            key=lambda sample: getattr(sample.design, varied_coordinate),
+        )
         for label, objective_name in (
             ("Jet-A", ObjectiveName.JET_A_NOX),
             ("LNG", ObjectiveName.LNG_NOX),
         ):
-            values = [sample.objectives.values[objective_name] for sample in pool]
+            values = [sample.objectives.values[objective_name] for sample in ordered_pool]
             best_index = values.index(min(values))
             if best_index in (0, len(values) - 1):
                 unbracketed.append(label)
@@ -300,6 +309,7 @@ def cost_of_shared_liner(
         jet_a_penalty=jet_a_penalty, lng_penalty=lng_penalty,
         is_degenerate=degenerate, sample_count=len(samples),
         unbracketed=tuple(unbracketed),
+        varied_coordinate=varied_coordinate,
     )
 
 

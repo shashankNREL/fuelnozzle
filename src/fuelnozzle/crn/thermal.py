@@ -21,11 +21,15 @@ boils and vapour-locks. Either can veto an otherwise attractive packaging.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from scipy.optimize import brentq
 
-from fuelnozzle.models import ModelWarning, WarningSeverity
+from fuelnozzle.crn.autoignition import AutoignitionMargin, AutoignitionVerdict
+from fuelnozzle.crn.status import GateStatus
+from fuelnozzle.feed import LNGFeedLineResult
+from fuelnozzle.models import ModelWarning, ThermodynamicState, WarningSeverity
 from fuelnozzle.properties import CoolPropLNGProvider, PropertyCalculationError
 
 #: Jet-A begins to form deposits above roughly this wall temperature. It is an input
@@ -38,6 +42,10 @@ DEFAULT_MINIMUM_SUBCOOLING_K = 5.0
 
 class SupercriticalFeedError(ValueError):
     """The feed pressure is above the critical point, where saturation does not exist."""
+
+
+class InfeasibleThermalTargetError(ValueError):
+    """A requested inverse thermal target lies outside its declared bracket or phase limits."""
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,38 @@ class HeatSinkBudget:
     warnings: tuple[ModelWarning, ...]
 
 
+@dataclass(frozen=True)
+class FeedPathHeatBudget:
+    """Energy and phase ledger along an already solved LNG feed-pressure path."""
+
+    total_heat_w: float
+    enthalpy_rise_w: float
+    energy_residual_w: float
+    pressure_drop_pa: float
+    outlet_vapor_quality_mass: float
+    first_two_phase_position_m: float | None
+
+
+def feed_path_heat_budget(
+    result: LNGFeedLineResult,
+    mass_flow_kg_s: float,
+) -> FeedPathHeatBudget:
+    """Cross-check tank-to-injector duty on the actual pressure/enthalpy march."""
+    if mass_flow_kg_s <= 0.0:
+        raise ValueError("Feed-path heat budget requires positive mass flow")
+    enthalpy_rise = mass_flow_kg_s * (
+        result.outlet_state.enthalpy_j_kg - result.inlet_state.enthalpy_j_kg
+    )
+    return FeedPathHeatBudget(
+        total_heat_w=result.total_heat_leak_w,
+        enthalpy_rise_w=enthalpy_rise,
+        energy_residual_w=enthalpy_rise - result.total_heat_leak_w,
+        pressure_drop_pa=result.pressure_drop_pa,
+        outlet_vapor_quality_mass=result.outlet_state.vapor_quality_mass or 0.0,
+        first_two_phase_position_m=result.first_two_phase_position_m,
+    )
+
+
 def heat_sink_budget(
     provider: CoolPropLNGProvider,
     mass_flow_kg_s: float,
@@ -83,25 +123,51 @@ def heat_sink_budget(
     latent_heat = dew.enthalpy_j_kg - bubble.enthalpy_j_kg
     saturation_temperature = bubble.temperature_k
 
-    def enthalpy(temperature_k: float) -> float:
-        if temperature_k < saturation_temperature:
-            return provider.state_pt(pressure_pa, temperature_k).enthalpy_j_kg
-        if temperature_k > saturation_temperature:
-            return provider.state_pt(pressure_pa, temperature_k).enthalpy_j_kg
-        return bubble.enthalpy_j_kg
+    def state_at_temperature(temperature_k: float) -> ThermodynamicState:
+        if abs(temperature_k - bubble.temperature_k) <= 1.0e-6:
+            return bubble
+        if abs(temperature_k - dew.temperature_k) <= 1.0e-6:
+            return dew
+        return provider.state_pt(pressure_pa, temperature_k)
 
-    tank_enthalpy = enthalpy(min(tank_temperature_k, saturation_temperature - 0.01))
-    total = 0.0
-    sensible = 0.0
-    latent = 0.0
-    superheat = 0.0
-    quality = 0.0
+    tank_state = state_at_temperature(tank_temperature_k)
+    nozzle_state = state_at_temperature(nozzle_temperature_k)
+    tank_enthalpy = tank_state.enthalpy_j_kg
+    nozzle_enthalpy = nozzle_state.enthalpy_j_kg
+    if nozzle_enthalpy < tank_enthalpy:
+        raise ValueError("Nozzle state is colder in enthalpy than the tank state")
 
-    if nozzle_temperature_k < saturation_temperature:
+    sensible_enthalpy = max(
+        0.0,
+        min(nozzle_enthalpy, bubble.enthalpy_j_kg) - tank_enthalpy,
+    )
+    latent_enthalpy = max(
+        0.0,
+        min(nozzle_enthalpy, dew.enthalpy_j_kg)
+        - max(tank_enthalpy, bubble.enthalpy_j_kg),
+    )
+    superheat_enthalpy = max(
+        0.0,
+        nozzle_enthalpy - max(tank_enthalpy, dew.enthalpy_j_kg),
+    )
+    sensible = mass_flow_kg_s * sensible_enthalpy
+    latent = mass_flow_kg_s * latent_enthalpy
+    superheat = mass_flow_kg_s * superheat_enthalpy
+    total = mass_flow_kg_s * (nozzle_enthalpy - tank_enthalpy)
+    quality = (
+        nozzle_state.vapor_quality_mass
+        if nozzle_state.vapor_quality_mass is not None
+        else (
+            0.0
+            if nozzle_enthalpy <= bubble.enthalpy_j_kg
+            else 1.0
+            if nozzle_enthalpy >= dew.enthalpy_j_kg
+            else latent_enthalpy / latent_heat
+        )
+    )
+
+    if nozzle_enthalpy < bubble.enthalpy_j_kg:
         # Still liquid at the injector: no flashing, so no flash atomization.
-        nozzle_enthalpy = enthalpy(nozzle_temperature_k)
-        sensible = mass_flow_kg_s * (nozzle_enthalpy - tank_enthalpy)
-        total = sensible
         warnings.append(
             ModelWarning(
                 code="LNG_SUBCOOLED_AT_NOZZLE",
@@ -113,18 +179,6 @@ def heat_sink_budget(
                 ),
             )
         )
-    else:
-        sensible = mass_flow_kg_s * (bubble.enthalpy_j_kg - tank_enthalpy)
-        if nozzle_temperature_k <= saturation_temperature + 1.0e-6:
-            quality = 0.0
-            total = sensible
-        else:
-            vapor_enthalpy = enthalpy(nozzle_temperature_k)
-            latent = mass_flow_kg_s * latent_heat
-            superheat = mass_flow_kg_s * (vapor_enthalpy - dew.enthalpy_j_kg)
-            quality = 1.0
-            total = sensible + latent + superheat
-
     return HeatSinkBudget(
         mass_flow_kg_s=mass_flow_kg_s,
         tank_temperature_k=tank_temperature_k,
@@ -165,9 +219,58 @@ def fuel_temperature_for_target_superheat(
         ) from error
     target = chamber_saturation + target_superheat_k
     if target >= feed_saturation:
-        # The fuel would boil in the feed line before reaching the injector.
-        return feed_saturation
+        raise InfeasibleThermalTargetError(
+            f"Target temperature {target:.2f} K reaches or exceeds the "
+            f"{feed_saturation:.2f} K feed bubble point; the requested superheat would "
+            "boil the fuel upstream."
+        )
     return target
+
+
+@dataclass(frozen=True)
+class HeatSourceModel:
+    """Declared off-design heat source used to bound recoverable LNG heating."""
+
+    hot_inlet_temperature_k: float
+    hot_mass_flow_kg_s: float
+    hot_specific_heat_j_kg_k: float
+    effectiveness: float
+    minimum_pinch_k: float
+    fuel_side_pressure_loss_pa: float = 0.0
+    evidence_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if min(
+            self.hot_inlet_temperature_k,
+            self.hot_mass_flow_kg_s,
+            self.hot_specific_heat_j_kg_k,
+        ) <= 0.0:
+            raise ValueError(
+                "Heat-source temperature, mass flow, and heat capacity must be positive"
+            )
+        if not 0.0 < self.effectiveness <= 1.0:
+            raise ValueError("Heat-exchanger effectiveness must lie in (0, 1]")
+        if self.minimum_pinch_k < 0.0 or self.fuel_side_pressure_loss_pa < 0.0:
+            raise ValueError("Pinch and pressure loss cannot be negative")
+
+    def available_heat_w(
+        self,
+        fuel_inlet_temperature_k: float,
+        fuel_outlet_temperature_k: float,
+    ) -> float:
+        hot_capacity_w_k = self.hot_mass_flow_kg_s * self.hot_specific_heat_j_kg_k
+        effectiveness_limit = (
+            self.effectiveness
+            * hot_capacity_w_k
+            * max(self.hot_inlet_temperature_k - fuel_inlet_temperature_k, 0.0)
+        )
+        pinch_limit = hot_capacity_w_k * max(
+            self.hot_inlet_temperature_k
+            - fuel_outlet_temperature_k
+            - self.minimum_pinch_k,
+            0.0,
+        )
+        return min(effectiveness_limit, pinch_limit)
 
 
 @dataclass(frozen=True)
@@ -181,6 +284,8 @@ class ThermalWindowPoint:
     has_sufficient_subcooling: bool
     heat_duty_w: float
     within_available_heat: bool
+    autoignition_status: GateStatus = GateStatus.UNKNOWN
+    heat_source_status: GateStatus = GateStatus.UNKNOWN
 
     @property
     def is_feasible(self) -> bool:
@@ -188,7 +293,19 @@ class ThermalWindowPoint:
             self.has_sufficient_superheat
             and self.has_sufficient_subcooling
             and self.within_available_heat
+            and self.autoignition_status is not GateStatus.FAIL
         )
+
+    @property
+    def acceptance_status(self) -> GateStatus:
+        if not self.is_feasible:
+            return GateStatus.FAIL
+        if (
+            self.autoignition_status is GateStatus.UNKNOWN
+            or self.heat_source_status is GateStatus.UNKNOWN
+        ):
+            return GateStatus.UNKNOWN
+        return GateStatus.PASS
 
 
 @dataclass(frozen=True)
@@ -234,6 +351,8 @@ def thermal_window(
     minimum_superheat_k: float = 5.0,
     minimum_subcooling_k: float = DEFAULT_MINIMUM_SUBCOOLING_K,
     available_heat_w: float | None = None,
+    heat_source: HeatSourceModel | None = None,
+    autoignition_evaluator: Callable[[float], AutoignitionMargin] | None = None,
 ) -> ThermalWindow:
     """Evaluate every constraint across a range of candidate fuel temperatures.
 
@@ -260,13 +379,36 @@ def thermal_window(
         superheat = temperature - chamber_saturation
         subcooling = feed_saturation - temperature
         try:
+            # Heating occurs upstream at feed pressure. The chamber-pressure flash is a
+            # separate isenthalpic nozzle calculation.
             budget = heat_sink_budget(
                 provider, mass_flow_kg_s, tank_temperature_k, temperature,
-                chamber_pressure_pa,
+                feed_pressure_pa,
             )
             duty = budget.total_duty_w
         except (ValueError, PropertyCalculationError):
             duty = float("nan")
+
+        source_limit = available_heat_w
+        source_status = GateStatus.UNKNOWN
+        if heat_source is not None:
+            source_limit = heat_source.available_heat_w(tank_temperature_k, temperature)
+            source_status = (
+                GateStatus.PASS if heat_source.evidence_id else GateStatus.UNKNOWN
+            )
+        elif available_heat_w is not None:
+            source_status = GateStatus.UNKNOWN
+
+        ignition_status = GateStatus.UNKNOWN
+        if autoignition_evaluator is not None:
+            verdict = autoignition_evaluator(temperature).verdict
+            ignition_status = {
+                AutoignitionVerdict.SAFE: GateStatus.PASS,
+                AutoignitionVerdict.MARGINAL: GateStatus.FAIL,
+                AutoignitionVerdict.UNSAFE: GateStatus.FAIL,
+                AutoignitionVerdict.UNKNOWN: GateStatus.UNKNOWN,
+                AutoignitionVerdict.NO_PREMIXER: GateStatus.PASS,
+            }[verdict]
 
         points.append(
             ThermalWindowPoint(
@@ -277,9 +419,11 @@ def thermal_window(
                 has_sufficient_subcooling=subcooling >= minimum_subcooling_k,
                 heat_duty_w=duty,
                 within_available_heat=(
-                    available_heat_w is None
-                    or (duty == duty and duty <= available_heat_w)
+                    source_limit is None
+                    or (duty == duty and duty <= source_limit)
                 ),
+                autoignition_status=ignition_status,
+                heat_source_status=source_status,
             )
         )
 
@@ -339,12 +483,19 @@ class IdleCircuitScreen:
     jet_a_coking_safe: bool | None
     lng_vapor_locked: bool | None
     warnings: tuple[ModelWarning, ...]
+    transient_status: GateStatus = GateStatus.UNKNOWN
 
     @property
     def is_safe(self) -> bool:
         return not any(
             warning.severity is WarningSeverity.ERROR for warning in self.warnings
         )
+
+    @property
+    def acceptance_status(self) -> GateStatus:
+        if not self.is_safe:
+            return GateStatus.FAIL
+        return self.transient_status
 
 
 def idle_circuit_screen(
@@ -354,6 +505,10 @@ def idle_circuit_screen(
     provider: CoolPropLNGProvider | None = None,
     circuit_pressure_pa: float = 5.0e5,
     coking_limit_k: float = DEFAULT_JET_A_COKING_LIMIT_K,
+    soak_duration_s: float | None = None,
+    purge_mass_flow_kg_s: float | None = None,
+    purge_duration_s: float | None = None,
+    restart_demonstrated: bool = False,
 ) -> IdleCircuitScreen:
     """Screen the stagnant circuit for coking or vapour lock.
 
@@ -415,6 +570,45 @@ def idle_circuit_screen(
     else:
         raise ValueError(f"Unknown active fuel {active_fuel!r}")
 
+    transient_status = GateStatus.UNKNOWN
+    if soak_duration_s is not None:
+        if soak_duration_s < 0.0:
+            raise ValueError("Soak duration cannot be negative")
+        purge_complete = (
+            purge_mass_flow_kg_s is not None
+            and purge_mass_flow_kg_s > 0.0
+            and purge_duration_s is not None
+            and purge_duration_s > 0.0
+        )
+        transient_status = (
+            GateStatus.PASS
+            if purge_complete and restart_demonstrated
+            else GateStatus.FAIL
+        )
+        if transient_status is GateStatus.FAIL:
+            warnings.append(
+                ModelWarning(
+                    code="IDLE_CIRCUIT_TRANSIENT_UNSAFE",
+                    severity=WarningSeverity.ERROR,
+                    message=(
+                        "A thermal-soak interval was declared without both a positive purge "
+                        "and demonstrated restart capability."
+                    ),
+                )
+            )
+    else:
+        warnings.append(
+            ModelWarning(
+                code="IDLE_CIRCUIT_TRANSIENT_UNKNOWN",
+                severity=WarningSeverity.WARNING,
+                message=(
+                    "Soak duration, purge flow/time, deposit evidence, and restart evidence "
+                    "were not supplied; steady wall-temperature screening cannot establish "
+                    "mission restart safety."
+                ),
+            )
+        )
+
     return IdleCircuitScreen(
         idle_fuel="jet_a" if active_fuel == "lng" else "lng",
         wall_temperature_k=wall_temperature_k,
@@ -422,6 +616,7 @@ def idle_circuit_screen(
         jet_a_coking_safe=jet_a_safe,
         lng_vapor_locked=vapor_locked,
         warnings=tuple(warnings),
+        transient_status=transient_status,
     )
 
 
@@ -470,9 +665,17 @@ def solve_temperature_for_duty(
             - duty_w
         )
 
-    low, high = bracket_k
+    low, high = max(bracket_k[0], tank_temperature_k), bracket_k[1]
+    if low >= high:
+        raise InfeasibleThermalTargetError(
+            "Temperature bracket does not extend above the tank temperature"
+        )
     if residual(low) > 0.0:
-        return low
+        raise InfeasibleThermalTargetError(
+            "Requested duty lies below the duty at the lower temperature bracket"
+        )
     if residual(high) < 0.0:
-        return high
+        raise InfeasibleThermalTargetError(
+            "Requested duty lies above the duty at the upper temperature bracket"
+        )
     return float(brentq(residual, low, high, xtol=1.0e-4))

@@ -1,4 +1,4 @@
-"""Prototype screening evaluation of one design across a mission set.
+"""Physics-gated evaluation of one design across a mission set.
 
 This is the inner loop of every sweep and every search, so it has to be both correct and
 quick. Two choices make it quick.
@@ -6,14 +6,14 @@ quick. Two choices make it quick.
 Mechanism objects and ignition-delay tables are cached across evaluations, because
 building them dominates the cost of a single point and none of them depend on the design.
 
-Fuel is introduced prevaporized rather than through the full droplet coupling. This mode is
-for diagnostics and screening only: agreement in temperature does not establish agreement
-in NOx, mixing, atomization, or operability. A result from this evaluator is therefore not a
-validated conceptual design.
+An explicit spray-model callback can supply the nozzle result and liquid properties for
+conservative gas/liquid coupling. Omitting it retains a fast prevaporized diagnostic, but the
+acceptance gate then remains UNKNOWN.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import cantera as ct
@@ -21,6 +21,7 @@ import cantera as ct
 from fuelnozzle.crn.autoignition import (
     AutoignitionMargin,
     AutoignitionVerdict,
+    FlashbackScreen,
     IgnitionDelayTable,
     autoignition_margin,
     premix_state,
@@ -30,14 +31,18 @@ from fuelnozzle.crn.chemistry import (
     MechanismRegistry,
     MechanismRole,
     emission_index_g_per_kg,
-    equivalence_ratio,
     stoichiometric_air_fuel_ratio,
+    validate_mechanism,
 )
+from fuelnozzle.crn.coupling import CoupledSolution, solve_coupled
 from fuelnozzle.crn.design import DesignVector, MissionPoint
+from fuelnozzle.crn.droplets import LiquidPropertyProvider
+from fuelnozzle.crn.emissions import LTOMode, LTOResult, lto_dp_foo
 from fuelnozzle.crn.hardware import AirflowMode, DualFuelHardware
 from fuelnozzle.crn.mission import MissionProfile, mission_point_from_operating
 from fuelnozzle.crn.network import CombustorNetwork, NetworkError
 from fuelnozzle.crn.reactors import InletSpec, OutletSpec
+from fuelnozzle.crn.spray_source import SprayBoundary
 from fuelnozzle.crn.status import GateResult, GateStatus, aggregate_gate_status
 from fuelnozzle.crn.templates import (
     Architecture,
@@ -48,8 +53,10 @@ from fuelnozzle.crn.templates import (
     quench_residence_time_s,
     rql_architecture,
 )
+from fuelnozzle.crn.thermal import IdleCircuitScreen, idle_circuit_screen
 from fuelnozzle.models import ModelWarning, WarningSeverity
 from fuelnozzle.operating import OperatingPoint
+from fuelnozzle.properties import CoolPropLNGProvider
 
 #: Temperatures at which ignition delay is tabulated once per fuel.
 IGNITION_TABLE_TEMPERATURES_K = (650.0, 700.0, 750.0, 800.0, 850.0, 900.0, 1000.0)
@@ -79,6 +86,11 @@ class PointResult:
     computational_status: GateStatus
     acceptance_status: GateStatus
     gates: tuple[GateResult, ...]
+    mechanism_path: str
+    mechanism_provenance: str
+    coupled_spray: CoupledSolution | None = None
+    idle_circuit: IdleCircuitScreen | None = None
+    flashback: FlashbackScreen | None = None
 
     @property
     def feasible(self) -> bool:
@@ -102,30 +114,72 @@ class DesignResult:
     computational_status: GateStatus
     acceptance_status: GateStatus
     gates: tuple[GateResult, ...]
+    rated_thrust_kn: float | None = None
 
     @property
     def feasible(self) -> bool:
         """Compatibility view: only an accepted design is feasible."""
         return self.acceptance_status is GateStatus.PASS
 
+    @property
+    def exit_gate_satisfied(self) -> bool:
+        """Stage-5/7 credibility gate; missing evidence never becomes success."""
+        return self.acceptance_status is GateStatus.PASS and all(
+            point.acceptance_status is GateStatus.PASS for point in self.points
+        )
+
     def by_fuel(self, fuel: FuelKind) -> tuple[PointResult, ...]:
         return tuple(result for result in self.points if result.point.fuel is fuel)
 
     def weighted_ei_nox(self, fuel: FuelKind) -> float:
-        """Time-weighted emission index for one fuel, or the plain mean without times."""
+        """Fuel-mass-weighted emission index for one fuel."""
         results = self.by_fuel(fuel)
         if not results:
             return 0.0
-        weights = [max(result.point.duration_s, 0.0) for result in results]
+        weights = [
+            max(result.point.duration_s, 0.0)
+            * max(result.point.fuel_mass_flow_kg_s, 0.0)
+            for result in results
+        ]
         if sum(weights) <= 0.0:
             return sum(result.ei_nox_g_per_kg for result in results) / len(results)
         return sum(
             result.ei_nox_g_per_kg * weight for result, weight in zip(results, weights, strict=True)
         ) / sum(weights)
 
+    def lto_emissions(self) -> LTOResult | None:
+        """Assemble the four-mode Jet-A Dp/Foo result when rated thrust is known."""
+        if self.rated_thrust_kn is None:
+            return None
+        modes = tuple(
+            LTOMode(
+                name=result.point.name,
+                thrust_fraction=result.point.thrust_fraction,
+                duration_s=result.point.duration_s,
+                fuel_mass_flow_kg_s=result.point.fuel_mass_flow_kg_s,
+                ei_nox_g_per_kg=result.ei_nox_g_per_kg,
+            )
+            for result in self.by_fuel(FuelKind.JET_A)
+        )
+        return lto_dp_foo(modes, self.rated_thrust_kn) if modes else None
+
+    def lng_cruise_ei_by_point(self) -> dict[str, float]:
+        """Keep named cruise results visible rather than hiding them in one average."""
+        return {
+            result.point.name: result.ei_nox_g_per_kg
+            for result in self.by_fuel(FuelKind.LNG)
+        }
+
+
+SprayModel = Callable[
+    [MissionPoint, DesignVector],
+    tuple[SprayBoundary, LiquidPropertyProvider],
+]
+FlashbackModel = Callable[[MissionPoint, DesignVector], FlashbackScreen]
+
 
 class DesignEvaluator:
-    """Runs a prototype, prevaporized screening model over a fixed mission set."""
+    """Runs a gated gas-only or gas/liquid model over a fixed mission set."""
 
     def __init__(
         self,
@@ -139,6 +193,10 @@ class DesignEvaluator:
         lng_architecture: str | None = None,
         minimum_autoignition_margin: float = 4.0,
         hardware: DualFuelHardware | None = None,
+        spray_model: SprayModel | None = None,
+        rated_thrust_kn: float | None = None,
+        lng_properties: CoolPropLNGProvider | None = None,
+        flashback_model: FlashbackModel | None = None,
     ) -> None:
         if architecture not in ARCHITECTURES:
             raise ValueError(f"Unknown architecture {architecture!r}")
@@ -158,6 +216,12 @@ class DesignEvaluator:
         self.lng_architecture = lng_architecture or architecture
         self.minimum_margin = minimum_autoignition_margin
         self.hardware = hardware
+        self.spray_model = spray_model
+        if rated_thrust_kn is not None and rated_thrust_kn <= 0.0:
+            raise ValueError("Rated thrust must be positive")
+        self.rated_thrust_kn = rated_thrust_kn
+        self.lng_properties = lng_properties
+        self.flashback_model = flashback_model
         self._tables: dict[tuple[FuelKind, float], IgnitionDelayTable] = {}
         self._afr: dict[FuelKind, float] = {}
 
@@ -237,25 +301,66 @@ class DesignEvaluator:
         def mechanism() -> ct.Solution:
             return self.registry.new_solution(point.fuel, MechanismRole.NETWORK)
 
-        inlets = list(architecture.air_inlets) + [
-            InletSpec(
-                name="fuel_vapor",
-                target_reactor=architecture.spray_path[0],
-                mass_flow_kg_s=point.fuel_mass_flow_kg_s,
-                temperature_k=design.fuel_temperature_k(point.fuel),
-                mole_fractions=spec.fuel_mole_fractions,
+        warnings.extend(
+            validate_mechanism(
+                spec,
+                mechanism(),
+                require_nox=True,
+                pressure_pa=point.pressure_pa,
+                temperature_k=point.air_temperature_k,
             )
-        ]
+        )
         total = point.air_mass_flow_kg_s + point.fuel_mass_flow_kg_s
+        coupled: CoupledSolution | None = None
 
         try:
-            network = CombustorNetwork(
-                architecture.reactors, inlets,
-                OutletSpec(source_reactor=architecture.outlet_reactor, mass_flow_kg_s=total),
-                architecture.internal_flows,
-                fixed_internal_flows=architecture.fixed_internal_flows,
-            )
-            solution = network.solve(mechanism, point.pressure_pa)
+            if self.spray_model is not None:
+                spray, liquid_provider = self.spray_model(point, design)
+                if spray.fuel is not point.fuel:
+                    raise ValueError("Spray boundary fuel does not match the mission point")
+                mismatch = abs(
+                    spray.total_fuel_mass_flow_kg_s - point.fuel_mass_flow_kg_s
+                )
+                if mismatch > 1.0e-9 * point.fuel_mass_flow_kg_s:
+                    raise ValueError(
+                        "Spray boundary fuel flow does not match the mission point"
+                    )
+                coupled = solve_coupled(
+                    architecture.reactors,
+                    architecture.air_inlets,
+                    architecture.outlet_reactor,
+                    architecture.internal_flows,
+                    mechanism,
+                    point.pressure_pa,
+                    spray,
+                    liquid_provider,
+                    architecture.spray_path,
+                    spec.fuel_mole_fractions,
+                    fixed_internal_flows=architecture.fixed_internal_flows,
+                )
+                solution = coupled.network
+                warnings.extend(coupled.warnings)
+            else:
+                inlets = list(architecture.air_inlets) + [
+                    InletSpec(
+                        name="fuel_vapor",
+                        target_reactor=architecture.spray_path[0],
+                        mass_flow_kg_s=point.fuel_mass_flow_kg_s,
+                        temperature_k=design.fuel_temperature_k(point.fuel),
+                        mole_fractions=spec.fuel_mole_fractions,
+                    )
+                ]
+                network = CombustorNetwork(
+                    architecture.reactors,
+                    inlets,
+                    OutletSpec(
+                        source_reactor=architecture.outlet_reactor,
+                        mass_flow_kg_s=total,
+                    ),
+                    architecture.internal_flows,
+                    fixed_internal_flows=architecture.fixed_internal_flows,
+                )
+                solution = network.solve(mechanism, point.pressure_pa)
         except (NetworkError, ValueError) as error:
             warnings.append(
                 ModelWarning(
@@ -282,6 +387,8 @@ class DesignEvaluator:
                         evidence="CombustorNetwork.solve",
                     ),
                 ),
+                mechanism_path=spec.path,
+                mechanism_provenance=spec.provenance,
             )
 
         warnings.extend(solution.warnings)
@@ -290,6 +397,9 @@ class DesignEvaluator:
         gas = mechanism()
         outlet = solution.outlet
         gas.TPY = outlet.temperature_k, point.pressure_pa, outlet.mass_fractions
+        exhaust_mass_flow = total - (
+            coupled.liquid_carryover_kg_s if coupled is not None else 0.0
+        )
         ei_nox = emission_index_g_per_kg(
             float(gas.Y[gas.species_index("NO")]) * 46.0055 / 30.0061
             + (
@@ -297,25 +407,31 @@ class DesignEvaluator:
                 if "NO2" in gas.species_names
                 else 0.0
             ),
-            total, point.fuel_mass_flow_kg_s,
+            exhaust_mass_flow, point.fuel_mass_flow_kg_s,
         )
-
-        ratios = []
-        for reactor in solution.reactors:
-            gas.TPY = reactor.temperature_k, point.pressure_pa, reactor.mass_fractions
-            ratios.append(equivalence_ratio(gas, spec))
-        temperatures = [reactor.temperature_k for reactor in solution.reactors]
 
         ignition = self._autoignition(design, point, architecture)
         if ignition is not None:
             warnings.extend(ignition.warnings)
+        idle_circuit: IdleCircuitScreen | None = None
+        if point.nozzle_wall_temperature_k is not None:
+            idle_circuit = idle_circuit_screen(
+                point.fuel.value,
+                point.nozzle_wall_temperature_k,
+                provider=self.lng_properties,
+            )
+            warnings.extend(idle_circuit.warnings)
+        flashback = (
+            self.flashback_model(point, design)
+            if self.flashback_model is not None
+            else None
+        )
+        if flashback is not None:
+            warnings.extend(flashback.warnings)
 
         computational_status = (
             GateStatus.PASS
-            if (
-            not any(w.severity is WarningSeverity.ERROR for w in warnings)
-            and solution.converged
-            )
+            if solution.converged and (coupled is None or coupled.converged)
             else GateStatus.FAIL
         )
         gates = [
@@ -333,10 +449,59 @@ class DesignEvaluator:
                 name="model_fidelity",
                 status=GateStatus.UNKNOWN,
                 reason=(
-                    "the prototype evaluator uses prevaporized fuel and has no "
-                    "experimental validation for design acceptance"
+                    "no nozzle/spray callback was supplied; fuel is prevaporized"
+                    if coupled is None
+                    else "coupled spray physics lacks the required rig validation"
                 ),
                 evidence="docs/CRN_EQUATION_REGISTER.md",
+            ),
+            GateResult(
+                name="mechanism_validation",
+                status=GateStatus.UNKNOWN,
+                reason=(
+                    "mechanism structure and declared range were checked, but no held-out "
+                    "high-pressure emissions validation is registered"
+                ),
+                evidence=f"{spec.path}: {spec.provenance}",
+            ),
+            GateResult(
+                name="mechanism_applicability",
+                status=(
+                    GateStatus.UNKNOWN
+                    if all(
+                        bound is None
+                        for bound in (
+                            spec.min_pressure_pa,
+                            spec.max_pressure_pa,
+                            spec.min_temperature_k,
+                            spec.max_temperature_k,
+                        )
+                    )
+                    or (
+                        (
+                            spec.min_pressure_pa is not None
+                            and point.pressure_pa < spec.min_pressure_pa
+                        )
+                        or (
+                            spec.max_pressure_pa is not None
+                            and point.pressure_pa > spec.max_pressure_pa
+                        )
+                        or (
+                            spec.min_temperature_k is not None
+                            and point.air_temperature_k < spec.min_temperature_k
+                        )
+                        or (
+                            spec.max_temperature_k is not None
+                            and point.air_temperature_k > spec.max_temperature_k
+                        )
+                    )
+                    else GateStatus.PASS
+                ),
+                reason=(
+                    "mechanism state is checked against its declared "
+                    "pressure/temperature domain"
+                ),
+                evidence=f"{spec.path}: {spec.provenance}",
             ),
             GateResult(
                 name="canonical_hardware",
@@ -353,6 +518,63 @@ class DesignEvaluator:
                 evidence="fuelnozzle.crn.mission and fuelnozzle.crn.hardware",
             ),
         ]
+        if coupled is not None:
+            gates.extend(
+                [
+                    GateResult(
+                        name="spray_mass_closure",
+                        status=(
+                            GateStatus.PASS
+                            if abs(coupled.fuel_mass_residual_kg_s)
+                            <= 1.0e-9 * point.fuel_mass_flow_kg_s
+                            else GateStatus.FAIL
+                        ),
+                        reason=(
+                            "nozzle vapor, evaporated fuel, and carryover close the "
+                            "fuel-mass ledger"
+                        ),
+                        evidence="fuelnozzle.crn.coupling.solve_coupled",
+                    ),
+                    GateResult(
+                        name="liquid_carryover",
+                        status=(
+                            GateStatus.PASS
+                            if coupled.liquid_carryover_kg_s
+                            <= 1.0e-6 * point.fuel_mass_flow_kg_s
+                            else GateStatus.FAIL
+                        ),
+                        reason=(
+                            f"liquid carryover is {coupled.liquid_carryover_kg_s:.4g} kg/s"
+                        ),
+                        evidence="fuelnozzle.crn.coupling.solve_coupled",
+                    ),
+                    GateResult(
+                        name="spray_validation",
+                        status=GateStatus.UNKNOWN,
+                        reason=(
+                            "spray size, breakup, impingement, and multicomponent "
+                            "evaporation do not have full-range calibration"
+                        ),
+                        evidence="docs/CRN_EQUATION_REGISTER.md",
+                    ),
+                ]
+            )
+        gates.append(
+            GateResult(
+                name="idle_circuit",
+                status=(
+                    idle_circuit.acceptance_status
+                    if idle_circuit is not None
+                    else GateStatus.UNKNOWN
+                ),
+                reason=(
+                    "idle circuit steady and transient screen evaluated"
+                    if idle_circuit is not None
+                    else "no nozzle wall temperature or idle-circuit transient evidence"
+                ),
+                evidence="fuelnozzle.crn.thermal.idle_circuit_screen",
+            )
+        )
         if ignition is not None and ignition.verdict is not AutoignitionVerdict.NO_PREMIXER:
             ignition_status = {
                 AutoignitionVerdict.SAFE: GateStatus.PASS,
@@ -368,6 +590,54 @@ class DesignEvaluator:
                     evidence=ignition.mechanism_path,
                 )
             )
+            gates.append(
+                GateResult(
+                    name="ignition_mechanism_bracket",
+                    status=GateStatus.UNKNOWN,
+                    reason=(
+                        "only one dedicated ignition mechanism is available; the lower "
+                        "confidence bound across defensible Jet-A/LNG mechanisms is unknown"
+                    ),
+                    evidence="mech/README.md",
+                )
+            )
+            gates.append(
+                GateResult(
+                    name="flashback",
+                    status=(
+                        GateStatus.UNKNOWN
+                        if flashback is None or flashback.is_safe is None
+                        else GateStatus.FAIL
+                        if not flashback.is_safe
+                        else GateStatus.PASS
+                        if flashback.calibration_id
+                        else GateStatus.UNKNOWN
+                    ),
+                    reason=(
+                        "no passage flame-speed screen was supplied"
+                        if flashback is None
+                        else "flashback correlation is unsafe or lacks passage calibration"
+                    ),
+                    evidence=(
+                        flashback.calibration_id if flashback is not None else None
+                    ),
+                )
+            )
+        gates.extend(
+            GateResult(
+                name=name,
+                status=GateStatus.UNKNOWN,
+                reason="external gate: no validated model or hardware-matched rig evidence",
+                evidence="docs/CRN_IMPLEMENTATION_LOG.md",
+            )
+            for name in (
+                "lean_blowout",
+                "transient_ignition",
+                "relight",
+                "fuel_switching",
+                "thermoacoustics",
+            )
+        )
         acceptance_status = aggregate_gate_status(gates)
         return PointResult(
             point=point,
@@ -375,15 +645,20 @@ class DesignEvaluator:
             exit_temperature_k=outlet.temperature_k,
             peak_temperature_k=solution.peak_temperature_k,
             ei_nox_g_per_kg=ei_nox,
-            equivalence_ratio_spread=max(ratios) - min(ratios),
+            equivalence_ratio_spread=float("nan"),
             near_field_equivalence_ratio=architecture.near_field_equivalence_ratio,
-            exit_temperature_spread_k=max(temperatures) - min(temperatures),
+            exit_temperature_spread_k=float("nan"),
             quench_residence_time_s=quench_residence_time_s(solution),
             autoignition=ignition,
             warnings=tuple(warnings),
             computational_status=computational_status,
             acceptance_status=acceptance_status,
             gates=tuple(gates),
+            mechanism_path=spec.path,
+            mechanism_provenance=spec.provenance,
+            coupled_spray=coupled,
+            idle_circuit=idle_circuit,
+            flashback=flashback,
         )
 
     def _autoignition(
@@ -447,4 +722,5 @@ class DesignEvaluator:
             computational_status=aggregate_gate_status(computational_gates),
             acceptance_status=aggregate_gate_status(acceptance_gates),
             gates=acceptance_gates,
+            rated_thrust_kn=self.rated_thrust_kn,
         )

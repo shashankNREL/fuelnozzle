@@ -76,6 +76,8 @@ class CFDSprayBoundary:
     effective_orifice_diameter_m: float
     number_of_orifices: int
     spray_regime: FlashSprayRegime
+    liquid_mole_fractions: dict[str, float] | None = None
+    vapor_mole_fractions: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,11 @@ def solve_lng_flash_spray(
     exit_point = tier2.path[-1]
     exit_temperature_k = tier2.tier1.path[-1].temperature_k
     effective_diameter = geometry.orifice_diameter_m or tier2.required_orifice_diameter_m
+    equilibrium_exit = properties.state_ph(
+        exit_point.pressure_pa,
+        tier0.nozzle_inlet_state.enthalpy_j_kg,
+        temperature_hint_k=exit_temperature_k,
+    )
     cfd_boundary = CFDSprayBoundary(
         mass_flow_kg_s=operating_point.lng_mass_flow_kg_s,
         pressure_pa=exit_point.pressure_pa,
@@ -201,6 +208,8 @@ def solve_lng_flash_spray(
         effective_orifice_diameter_m=effective_diameter,
         number_of_orifices=geometry.number_of_orifices,
         spray_regime=regime,
+        liquid_mole_fractions=equilibrium_exit.liquid_mole_fractions,
+        vapor_mole_fractions=equilibrium_exit.vapor_mole_fractions,
     )
 
     return Tier3FlashSpray(
